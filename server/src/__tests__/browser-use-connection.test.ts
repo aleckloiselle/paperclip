@@ -6,7 +6,8 @@ import http from "supertest";
 import { browserUseRoutes } from "../routes/browser-use.js";
 import { errorHandler } from "../middleware/index.js";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { readFile } from "node:fs/promises";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -291,6 +292,26 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
         },
       };
     }
+    it("reapplies the renumbered migration without losing existing browser work", async () => {
+      const f = await fixture();
+      await f.service.execute(f.binding, f.grant, randomUUID(), "browser_start", {
+        task: "Read example.com",
+        maxCostUsd: 0.5,
+      });
+      const previous = await db.select().from(browserUseRuns)
+        .where(eq(browserUseRuns.companyId, f.company.id));
+      expect(previous).toHaveLength(1);
+      const migration = await readFile(new URL(
+        "../../../packages/db/src/migrations/0289_daffy_pandemic.sql", import.meta.url,
+      ), "utf8");
+      for (let attempt = 0; attempt < 2; attempt++) {
+        for (const statement of migration.split("--> statement-breakpoint")) {
+          if (statement.trim()) await db.execute(sql.raw(statement));
+        }
+      }
+      expect(await db.select().from(browserUseRuns)
+        .where(eq(browserUseRuns.companyId, f.company.id))).toEqual(previous);
+    });
     it("delivers Browser Use through the pinned native and CLI runtime gateway", async () => {
       const f = await fixture();
       await db.insert(toolConnectionInstalls).values({
