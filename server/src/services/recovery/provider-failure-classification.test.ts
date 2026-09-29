@@ -7,6 +7,10 @@ import {
 import { legacyExecutionNeedsReconciliation } from "../legacy-execution-recovery.js";
 
 describe("classifyAdapterFailureForRecovery", () => {
+  it.each(["acpx_auth_required", "claude_auth_required", "codex_auth_required", "adapter_auth_missing", "refresh_token_reused", "authentication_required"])("does not automatically retry provider authentication failure %s", (errorCode) => {
+    expect(classifyContinuationFailure({ errorCode } as never)).toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
+  });
+
   it("uses a typed ACP quota reset without needing the provider's original message", () => {
     const now = new Date("2026-07-15T20:00:00.000Z");
     expect(classifyAdapterFailureForRecovery({

@@ -25,6 +25,7 @@ const getAgentMock = vi.hoisted(() => vi.fn());
 const updateAgentMock = vi.hoisted(() => vi.fn());
 const setDefaultMock = vi.hoisted(() => vi.fn());
 vi.mock("@/api/ai-connections", () => ({ aiConnectionsApi: { setDefault: (...args: unknown[]) => setDefaultMock(...args) } }));
+const adoptMock = vi.hoisted(() => vi.fn());
 const installMock = vi.hoisted(() => vi.fn());
 vi.mock("@/api/tools", () => ({ toolsApi: {
   getConnectionInstalls: async () => ({ installs: [] }),
@@ -32,6 +33,7 @@ vi.mock("@/api/tools", () => ({ toolsApi: {
 } }));
 
 vi.mock("@/api/agents", () => ({ agentsApi: {
+  adoptAiConnection: (...args: unknown[]) => adoptMock(...args),
   get: (...args: unknown[]) => getAgentMock(...args),
   update: (...args: unknown[]) => updateAgentMock(...args),
 } }));
@@ -177,6 +179,7 @@ beforeEach(() => {
   getAgentMock.mockReset();
   updateAgentMock.mockReset();
   installMock.mockReset();
+  adoptMock.mockReset();
   setupOptionsMock.mockReset();
   completeMock.mockReset();
   declineMock.mockReset();
@@ -453,27 +456,23 @@ describe("ConnectionIntentInteractionBody dialog behavior", () => {
 describe("AI repair inside the card", () => {
   const interaction: ConnectionIntentInteraction = { ...pendingConnectionIntentInteraction, payload: { ...pendingConnectionIntentInteraction.payload, purpose: "ai" } };
   const connection = { id: "selected-account", name: "My Codex account", provider: "openai", method: "api_key", ownership: "personal", ownerName: "Dotta", status: "revoked" };
-  it.each([false, true])("requires explicit validated legacy adoption (validation fails: %s)", async (fails) => {
+  it.each([false, true])("requires atomic validated legacy adoption (validation fails: %s)", async (fails) => {
     const binding = { provider: "openai", method: "subscription", mode: "responsible_user" };
     setupOptionsMock.mockResolvedValue({ interaction, existingConnections: [], aiConnection: binding, aiConnectionRequiresAdoption: true });
-    getAgentMock.mockResolvedValue({ id: interaction.payload.requestingAgentId, runtimeConfig: { heartbeat: { enabled: true } } });
-    if (fails) updateAgentMock.mockRejectedValue(new Error("Connection test failed"));
-    else updateAgentMock.mockResolvedValue({});
-    completeMock.mockResolvedValue({ ...interaction, status: "accepted" });
+    if (fails) adoptMock.mockRejectedValue(new Error("Connection test failed"));
+    else adoptMock.mockResolvedValue({ ...interaction, status: "accepted" });
     renderBody(interaction); await flush();
     await act(() => button("Fix connection")!.click());
     await act(() => button("Reconnect selected account")!.click());
-    expect(completeMock).not.toHaveBeenCalled();
-    expect(updateAgentMock).not.toHaveBeenCalled();
+    expect(adoptMock).not.toHaveBeenCalled();
     expect(document.body.textContent).toContain("This replaces the agent’s existing authentication");
     await act(() => button("Use connection and continue")!.click());
     await flush();
-    expect(updateAgentMock).toHaveBeenCalledWith(interaction.payload.requestingAgentId, { runtimeConfig: { heartbeat: { enabled: true }, aiConnection: binding } }, interaction.companyId);
-    expect(installMock).toHaveBeenCalledWith("new-ai-account", [{ targetType: "agent", targetId: interaction.payload.requestingAgentId }]);
-    if (fails) {
-      expect(completeMock).not.toHaveBeenCalled();
-      expect(document.querySelector('[role="alert"]')?.textContent).toContain("Connection test failed");
-    } else expect(completeMock).toHaveBeenCalledWith(interaction.id, "new-ai-account");
+    expect(adoptMock).toHaveBeenCalledWith(interaction.payload.requestingAgentId, interaction.id, "new-ai-account", interaction.companyId);
+    expect(updateAgentMock).not.toHaveBeenCalled();
+    expect(installMock).not.toHaveBeenCalled();
+    expect(completeMock).not.toHaveBeenCalled();
+    if (fails) expect(document.querySelector('[role="alert"]')?.textContent).toContain("Connection test failed");
   });
   it.each(["anthropic", "openai"])("connects a missing %s default directly in the task", async (provider) => {
     setupOptionsMock.mockResolvedValue({ interaction, existingConnections: [], aiConnection: { provider, method: "api_key", mode: "responsible_user" } });
@@ -536,6 +535,20 @@ describe("AI repair inside the card", () => {
     await act(() => button("Retry using this connection")!.click());
     await flush();
     expect(completeMock).toHaveBeenCalledWith(interaction.id, "new-subscription");
+  });
+  it("clears an account-selection retry when its setup is abandoned", async () => {
+    setupOptionsMock.mockResolvedValue({ interaction, existingConnections: [], aiConnection: { provider: "openai", method: "api_key", mode: "responsible_user" }, aiRepair: { connection, canReconnect: true } });
+    setDefaultMock.mockRejectedValueOnce(new Error("Could not select this account"));
+    renderBody(interaction); await flush();
+    await act(() => button("Fix connection")!.click());
+    await act(() => credentialRender.mock.lastCall![0].onComplete({ connectionId: "new-subscription", grantId: "new-grant", method: "subscription" }));
+    await flush();
+    expect(button("Retry using this connection")).toBeDefined();
+    await act(() => button("Cancel repair")!.click());
+    await act(() => button("Fix connection")!.click());
+    expect(button("Retry using this connection")).toBeUndefined();
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    expect(completeMock).not.toHaveBeenCalled();
   });
   it("keeps a late credential save after cancellation from accepting the request", async () => {
     setupOptionsMock.mockResolvedValue({ interaction, existingConnections: [], aiRepair: { connection, canReconnect: true } });

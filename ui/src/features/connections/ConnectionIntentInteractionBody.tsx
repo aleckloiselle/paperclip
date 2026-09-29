@@ -12,7 +12,6 @@ import type { AiAuthMethod, ConnectionIntentInteraction } from "@paperclipai/sha
 import { connectionIntentsApi } from "@/api/connection-intents";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { agentsApi } from "@/api/agents";
-import { toolsApi } from "@/api/tools";
 import { AiConnectionCredentialStep } from "@/components/ai-connections/AiConnectionCredentialStep";
 import { defaultAiConnectionName } from "@/components/ai-connections/model";
 import { AppLogo } from "@/pages/apps/AppLogo";
@@ -53,6 +52,7 @@ export function ConnectionIntentInteractionBody({
   const generation = setupGeneration.current;
   const closeSetup = () => {
     setupGeneration.current += 1;
+    selectAiAccountMutation.reset();
     setOpen(false);
   };
   const queryClient = useQueryClient();
@@ -129,21 +129,9 @@ export function ConnectionIntentInteractionBody({
     },
   });
   const adoptMutation = useMutation({
-    mutationFn: async (connectionId: string) => {
-      const binding = setupQuery.data?.aiConnection;
-      if (!binding) throw new Error("Reload connection setup and try again.");
-      const agent = await agentsApi.get(interaction.payload.requestingAgentId, interaction.companyId);
-      // Use the normal agent Save path: it checks permissions and validates the
-      // account in the agent's execution environment before adopting it.
-      if (!agent.runtimeConfig.aiConnection) {
-        const { installs } = await toolsApi.getConnectionInstalls(connectionId);
-        if (!installs.some((install) => install.targetType === "company" || install.targetId === agent.id)) {
-          await toolsApi.putConnectionInstalls(connectionId, [...installs, { targetType: "agent", targetId: agent.id }]);
-        }
-        await agentsApi.update(agent.id, { runtimeConfig: { ...agent.runtimeConfig, aiConnection: binding } }, interaction.companyId);
-      }
-      return connectionIntentsApi.complete(interaction.id, connectionId);
-    },
+    mutationFn: (connectionId: string) => agentsApi.adoptAiConnection(
+      interaction.payload.requestingAgentId, interaction.id, connectionId, interaction.companyId,
+    ),
     onSuccess: async (updatedInteraction) => {
       await invalidateTask(updatedInteraction);
       setAdoptionConnectionId(null);
@@ -484,7 +472,7 @@ export function ConnectionIntentInteractionBody({
         {isAi && open ? <div className="mt-4 border-t border-border pt-4" data-testid="ai-connection-inline-repair">{inlineContent}</div> : null}
 
         {completeMutation.isError ||
-        selectAiAccountMutation.isError ||
+        (selectAiAccountMutation.isError && selectAiAccountMutation.variables?.generation === generation) ||
         adoptMutation.isError ||
         declineMutation.isError ||
         phaseMutation.isError ? (
@@ -504,7 +492,7 @@ export function ConnectionIntentInteractionBody({
               : "Couldn’t update this connection request."}
           </p>
         ) : null}
-        {selectAiAccountMutation.isError && selectAiAccountMutation.variables && (
+        {selectAiAccountMutation.isError && selectAiAccountMutation.variables?.generation === generation && (
           <Button className="mt-3" onClick={() => selectAiAccountMutation.mutate(selectAiAccountMutation.variables!)}>
             Retry using this connection
           </Button>

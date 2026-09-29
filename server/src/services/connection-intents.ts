@@ -1,3 +1,4 @@
+import { agentService } from "./agents.js";
 import { logActivity } from "./activity-log.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
@@ -750,6 +751,7 @@ export function connectionIntentService(db: Db) {
     options: {
       canManageOrganizationGrant?: boolean;
       bypassCurrentMembershipCheck?: boolean;
+      validatedAdoption?: { agentUpdatedAt: Date; binding: AiConnectionBinding };
     } = {},
   ) {
     const loaded = await loadIntent(interactionId);
@@ -799,7 +801,27 @@ export function connectionIntentService(db: Db) {
       if (payload.purpose === "ai" && selectedConnection.connectionPurpose !== "ai") throw conflict("Select an AI account for this authentication request");
       if (selectedConnection.connectionPurpose === "ai") {
         if (payload.purpose !== "ai") throw conflict("AI authentication cannot satisfy a tool connection request");
-        const managed = await managedAgent(loaded.issue.companyId, payload.requestingAgentId, payload.serviceSlug);
+        let managed;
+        if (options.validatedAdoption) {
+          const [agent] = await tx.select().from(agents).where(and(eq(agents.id, payload.requestingAgentId), eq(agents.companyId, loaded.issue.companyId))).for("update");
+          if (!agent || agent.runtimeConfig.aiConnection || agent.updatedAt.getTime() !== options.validatedAdoption.agentUpdatedAt.getTime()) {
+            throw conflict("The agent changed during validation. Reload the task and try again.");
+          }
+          const binding = options.validatedAdoption.binding;
+          if (binding.provider !== payload.serviceSlug || binding.mode !== "responsible_user") throw conflict("Invalid legacy adoption binding");
+          const updated = await agentService(txDb).update(agent.id, {
+            runtimeConfig: { ...agent.runtimeConfig, aiConnection: binding },
+          }, { recordRevision: { createdByUserId: userId, source: "patch" } });
+          if (!updated) throw notFound("Agent not found");
+          await logActivity(txDb, {
+            companyId: loaded.issue.companyId, actorType: "user", actorId: userId,
+            action: "agent.updated", entityType: "agent", entityId: agent.id,
+            details: { connectionIntentId: interactionId, aiConnectionAdopted: true },
+          });
+          managed = { agent: updated, binding, requiresAdoption: false };
+        } else {
+          managed = await managedAgent(loaded.issue.companyId, payload.requestingAgentId, payload.serviceSlug);
+        }
         if (!managed) throw conflict("Configure the agent’s AI connection before using this account");
         const service = aiConnectionService(txDb);
         if (managed.binding.mode === "responsible_user") {

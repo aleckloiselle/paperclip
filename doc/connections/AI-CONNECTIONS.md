@@ -103,8 +103,8 @@ Provider authentication failures, including `acpx_auth_required`, adapter login
 requirements, and expired/invalidated refresh tokens, create an AI connection
 card as the failed run is finalized. The card names the provider and uses the
 same inline connection/reconnect controls as missing-account setup. Pending
-cards are deduplicated and provide the human continuation path before generic
-recovery retries. Tool permission errors and provider quota failures do not
+cards are deduplicated. Authentication failures suppress immediate and periodic
+generic retries until the responsible user repairs the connection. Tool permission errors and provider quota failures do not
 request model authentication.
 
 An attributed managed credential is marked as needing reauthorization only if
@@ -119,10 +119,11 @@ through the existing durable continuation delivery.
 
 For compatible legacy agents, the card offers the responsible person's provider
 connection without changing authentication automatically. After connecting,
-**Use connection and continue** explicitly adopts Connections through the normal
-agent update, including permission checks and validation in the agent's execution
-environment. A failed validation leaves the request pending and the old agent
-configuration intact. Unsupported harness/provider routes are not guessed.
+**Use connection and continue** checks agent-update permissions and validates in
+the agent's execution environment before committing the agent binding, connection
+install, audit, and card completion in one transaction. A failed validation or
+completion leaves the request pending and the old agent configuration and access
+intact. Unsupported harness/provider routes are not guessed.
 
 Codex ACP terminal failures with category `limit` and explicit usage-exhaustion
 wording enter provider-quota recovery. A supported reset clock uses the existing
