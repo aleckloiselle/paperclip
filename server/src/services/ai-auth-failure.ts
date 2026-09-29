@@ -8,6 +8,11 @@ export function isAiAuthenticationFailure(code: string | null | undefined): bool
   ));
 }
 
+/** Only a persisted blocked classification confirms that an inline repair owns recovery. */
+export function isAiAuthenticationBlocked(run: { errorCode?: string | null; livenessState?: string | null } | null | undefined): boolean {
+  return run?.livenessState === "blocked" && isAiAuthenticationFailure(run.errorCode);
+}
+
 export function aiBindingForAuthRecovery(
   adapterType: string,
   config: Record<string, unknown>,

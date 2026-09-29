@@ -1443,6 +1443,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/connection-intents/{interactionId}/setup-options",
   "POST /api/connection-intents/{interactionId}/phase",
   "POST /api/connection-intents/{interactionId}/complete",
+  "POST /api/agents/{id}/connection-intents/{interactionId}/adopt",
   "POST /api/connection-intents/{interactionId}/decline",
   "GET /api/companies/{companyId}/tools/profiles",
   "POST /api/companies/{companyId}/tools/profiles",
@@ -10272,6 +10273,23 @@ registerCurrentRoute({
   tags: ["connection-intents"],
   summary: "Complete an addressed connection request",
   body: completeConnectionIntentSchema,
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/agents/{id}/connection-intents/{interactionId}/adopt",
+  tags: ["connection-intents", "agents"],
+  summary: "Validate and atomically adopt an AI connection for a legacy agent",
+  body: completeConnectionIntentSchema,
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
 });
 
 registerCurrentRoute({

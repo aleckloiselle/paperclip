@@ -1,4 +1,4 @@
-import { isAiAuthenticationFailure } from "./ai-auth-failure.js";
+import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
 
@@ -18296,14 +18296,16 @@ export function heartbeatService(
     run: typeof heartbeatRuns.$inferSelect,
     resultJson?: Record<string, unknown> | null,
   ) {
-    if (run.status === "failed") {
-      await connectionIntentService(db).requestForRunAuthFailure(run.id).catch(() => {
-        logger.warn({ runId: run.id }, "Could not attach provider authentication repair; run failure remains available");
-      });
-    }
-    const classification = classifyRunLiveness(
-      await buildRunLivenessInput(run, resultJson),
-    );
+    const authRepair = run.status === "failed"
+      ? await connectionIntentService(db).requestForRunAuthFailure(run.id).catch(() => {
+          logger.warn({ runId: run.id }, "Could not attach provider authentication repair; run failure remains available");
+          return null;
+        })
+      : null;
+    const classification = classifyRunLiveness({
+      ...await buildRunLivenessInput(run, resultJson),
+      authenticationRepairRequested: Boolean(authRepair?.interactionId),
+    });
     return db
       .update(heartbeatRuns)
       .set({
@@ -26454,9 +26456,9 @@ export function heartbeatService(
         companyId: run.companyId,
         runId: run.id,
         now: new Date(),
-        // Authentication needs user action. This also covers the review path,
+        // A durable authentication card owns recovery. This covers the review path,
         // while continuation classification blocks periodic generic retries.
-        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationFailure(source?.errorCode),
+        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source),
       });
       await applyWakeQueuePostCommitEffects(postCommitEffects);
       const completed = await getRun(run.id);

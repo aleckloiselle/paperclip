@@ -103,8 +103,10 @@ Provider authentication failures, including `acpx_auth_required`, adapter login
 requirements, and expired/invalidated refresh tokens, create an AI connection
 card as the failed run is finalized. The card names the provider and uses the
 same inline connection/reconnect controls as missing-account setup. Pending
-cards are deduplicated. Authentication failures suppress immediate and periodic
-generic retries until the responsible user repairs the connection. Tool permission errors and provider quota failures do not
+cards are deduplicated. Creating a repair card persists a blocked run classification
+that suppresses immediate and periodic generic retries until the responsible user
+repairs the connection. Unsupported providers and failures that could not create
+a card retain their existing recovery path. Tool permission errors and provider quota failures do not
 request model authentication.
 
 An attributed managed credential is marked as needing reauthorization only if
