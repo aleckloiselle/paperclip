@@ -506,12 +506,13 @@ export function browserUseService(
       const rejected = error instanceof BrowserUseError && error.requestRejected;
       const message = rejected ? error.message :
         "Browser run creation could not be confirmed. Paperclip is locating and stopping possible provider work. Do not start another run yet.";
-      await db
-        .update(runs)
-        .set({ status: rejected ? "failed" : "unknown", eventsDrained: rejected ? 1 : 0 })
-        .where(eq(runs.invocationId, invocationId));
       await db.transaction(async tx => {
         const [current] = await tx.select().from(sessions).where(eq(sessions.id, s.id)).for("update");
+        // A restart must not leave a drained rejection attached to a starting
+        // session: that combination has neither recovery work nor an idle timer.
+        await tx.update(runs)
+          .set({ status: rejected ? "failed" : "unknown", eventsDrained: rejected ? 1 : 0 })
+          .where(eq(runs.invocationId, invocationId));
         const stopping = !rejected || current.stopRequested === "end";
         await tx.update(sessions).set({
           status: stopping ? "stopping" : (s.providerSessionId ? "idle" : "failed"),

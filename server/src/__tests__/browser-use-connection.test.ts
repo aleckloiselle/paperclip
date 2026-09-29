@@ -784,6 +784,33 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
       await f.tick();
       expect(await f.service.list(f.company.id, f.issue.id, actor.actorId)).toMatchObject([{ status: "closed" }]);
     });
+    it("rolls back an interrupted rejection and closes the existing browser after restart", async () => {
+      const f = await fixture();
+      const start = await f.service.execute(f.binding, f.grant, randomUUID(), "browser_start", { task: "Read" }) as { sessionId: string };
+      f.ready(); f.complete(); await f.tick();
+      f.reject(409);
+      const invocationId = randomUUID();
+      const transaction = db.transaction.bind(db);
+      const interrupted = vi.spyOn(db, "transaction").mockImplementation((callback, config) =>
+        transaction(async tx => {
+          const result = await callback(tx);
+          const [run] = await tx.select().from(browserUseRuns).where(eq(browserUseRuns.invocationId, invocationId));
+          if (run?.status === "failed") throw new Error("process interrupted before commit");
+          return result;
+        }, config));
+      try {
+        await expect(f.service.execute(f.binding, f.grant, invocationId, "browser_continue", { task: "Read again", sessionId: start.sessionId })).rejects.toThrow("process interrupted");
+      } finally {
+        interrupted.mockRestore();
+      }
+      const [pending] = await db.select().from(browserUseRuns).where(eq(browserUseRuns.invocationId, invocationId));
+      expect(pending).toMatchObject({ status: "creating", eventsDrained: 0, providerRunId: null });
+      await db.update(browserUseRuns).set({ createdAt: new Date(Date.now() - 61_000) }).where(eq(browserUseRuns.id, pending.id));
+      await db.update(browserUseSessions).set({ nextPollAt: new Date(0) }).where(eq(browserUseSessions.id, start.sessionId));
+      await browserUseService(db, f.request).sweep();
+      expect(await db.select().from(browserUseBrowsers).where(eq(browserUseBrowsers.sessionId, start.sessionId))).toMatchObject([{ status: "stopped" }]);
+      expect(f.request.mock.calls.filter(([url, init]) => url.endsWith("/runs") && init.method === "POST")).toHaveLength(2);
+    });
     it("recovers an accepted start after a lost response and restart, then stops and accounts without replay", async () => {
       const f = await fixture();
       f.loseReply(); f.recoveryPages(6);

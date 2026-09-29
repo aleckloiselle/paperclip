@@ -365,8 +365,9 @@ A missing list entry is not proof that no work exists: cleanup remains pending
 and retains the credential while recovery continues. Each sweep reads at most
 five pages. Continuations restrict recovery to their known provider session.
 
-Definite request rejections (such as HTTP 409 or 429) record a failed local run
-without closing an existing browser. That browser remains visible, retains its
-idle deadline, and can still be closed. Provider backoff also applies to cleanup.
+Definite request rejections (such as HTTP 409 or 429) atomically record a failed
+local run and return its existing browser to idle. That browser remains visible,
+gets a fresh idle grace period, and can still be closed. A crash before commit
+leaves the run eligible for recovery. Provider backoff also applies to cleanup.
 New-browser arrivals are queued in order and are acknowledged only after the
 panel has selected and persisted the tab. Polling cannot claim an unseen arrival.
