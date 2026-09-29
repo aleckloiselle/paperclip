@@ -229,11 +229,20 @@ describe("TaskSidePanel", () => {
 
   it("does not acknowledge a browser selection that could not be persisted", async () => {
     const acknowledged = vi.fn();
-    const write = vi.spyOn(window.localStorage, "setItem").mockImplementation(() => { throw new Error("storage full"); });
+    const descriptor = Object.getOwnPropertyDescriptor(window, "localStorage")!;
+    const storage = window.localStorage;
+    const write = vi.fn(() => { throw new Error("storage full"); });
+    // jsdom Storage instances ignore an own-method spy. Replace the surface
+    // explicitly so this failure injection also works with native Storage.
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: { getItem: storage.getItem.bind(storage), setItem: write },
+    });
     try {
       await render(panel({ openBrowserId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", onBrowserOpened: acknowledged }));
+      expect(write).toHaveBeenCalled();
       expect(acknowledged).not.toHaveBeenCalled();
-    } finally { write.mockRestore(); }
+    } finally { Object.defineProperty(window, "localStorage", descriptor); }
   });
 
   it("offers the existing live browser from a closed tab and distinguishes session tabs", async () => {
