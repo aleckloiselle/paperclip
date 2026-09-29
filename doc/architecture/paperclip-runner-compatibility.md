@@ -244,9 +244,14 @@ never be written back as a replacement journal.
 
 The transport's retained-session and cleanup readers use that same 192 MiB
 controller-journal ceiling; their runner/provider file limits stay unchanged.
-Those transport reads still load complete state. Proof scans also take time
-proportional to journal bytes. This fixes inconsistent reader limits, not
-unbounded history capacity or history-independent continuation latency.
+Transport needs complete command receipts, so it loads full state in a separate
+worker with a 512 MiB old-generation heap limit, at most eight queued reads, and
+separate 30-second queue and execution deadlines. File reads, JSON parsing, and
+hashing run in that worker; result transfer and consumers still incur work
+proportional to the retained state. Worker admission or execution failures do
+not classify valid state as corrupt. Proof scans also take time proportional
+to journal bytes. This fixes inconsistent reader limits, not unbounded history
+capacity or history-independent continuation latency.
 
 ## Required compatibility matrix
 

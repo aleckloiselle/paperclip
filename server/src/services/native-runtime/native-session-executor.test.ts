@@ -9281,6 +9281,7 @@ describe("runnerd provider runtime wiring", () => {
         await rm(stateBase, { recursive: true, force: true });
       }
     },
+    60_000,
   );
 
   it("quarantines legacy prior-run state only after the database proves a terminal owner in the same full scope", async () => {

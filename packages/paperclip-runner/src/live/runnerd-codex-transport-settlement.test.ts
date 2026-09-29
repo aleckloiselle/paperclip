@@ -1672,15 +1672,15 @@ it.each([
           await readFile(join(home, "auth.json"), "utf8"),
         );
       }
-      expect(retainedRunnerdCleanupProofIsCurrent(proof)).toBe(false);
+      expect(await retainedRunnerdCleanupProofIsCurrent(proof)).toBe(false);
       await rename(copy, activated);
-      expect(retainedRunnerdCleanupProofIsCurrent(proof)).toBe(true);
-      expect(retainedRunnerdCleanupProofIsCurrent({ ...proof })).toBe(false);
-      expect(() =>
+      expect(await retainedRunnerdCleanupProofIsCurrent(proof)).toBe(true);
+      expect(await retainedRunnerdCleanupProofIsCurrent({ ...proof })).toBe(false);
+      await expect(
         completeRetainedNativeSessionCleanup({ ...proof }),
-      ).toThrow();
-      expect(completeRetainedNativeSessionCleanup(proof)).toBe(1);
-      expect(completeRetainedNativeSessionCleanup(proof)).toBe(0);
+      ).rejects.toThrow();
+      expect(await completeRetainedNativeSessionCleanup(proof)).toBe(1);
+      expect(await completeRetainedNativeSessionCleanup(proof)).toBe(0);
       close.mockImplementation(async () => {});
       await expect(execute()).rejects.toThrow("fixture admission reached");
       expect(start).toHaveBeenCalledTimes(2);
@@ -1734,7 +1734,7 @@ it.each([
         join(activated, "runner/runner-state.json"),
         JSON.stringify({ ...finalState, lifecycle: "ready" }),
       );
-      expect(retainedRunnerdCleanupProofIsCurrent(proof)).toBe(false);
+      expect(await retainedRunnerdCleanupProofIsCurrent(proof)).toBe(false);
     } finally {
       for (const restore of replaySpyRestorers.reverse()) restore();
       await bundle.transport.close().catch(() => undefined);
@@ -1751,4 +1751,3 @@ it.each([
   },
   40_000,
 );
-

@@ -3572,7 +3572,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         .fingerprint !== settledHome.fingerprint
     )
       throw denied();
-    completeRetainedNativeSessionCleanup(proof);
+    await completeRetainedNativeSessionCleanup(proof);
     rmSync(resolve(owned.root, CLEANUP_ACTIVATION_FILE));
     return { status: "settled", runId: input.runId };
   } catch {
