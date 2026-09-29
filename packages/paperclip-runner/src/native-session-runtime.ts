@@ -88,10 +88,10 @@ const sessionOriginRunnerInstances = new WeakMap<NativeSession, string>();
 /** Retire only the exact owner whose separate authenticated cleanup completed.
  * The rejected close promise remains rejected; this neither resets a session
  * nor authorizes an execution. Other quarantined owners remain admission gates. */
-export async function completeRetainedNativeSessionCleanup(
+export function completeRetainedNativeSessionCleanup(
   proof: RetainedRunnerdCleanupProof,
-): Promise<number> {
-  if (!(await retainedRunnerdCleanupProofIsCurrent(proof)))
+): number {
+  if (!retainedRunnerdCleanupProofIsCurrent(proof))
     throw new NativeSessionCleanupQuarantinedError();
   const domain = JSON.stringify([
     proof.binding.companyId,

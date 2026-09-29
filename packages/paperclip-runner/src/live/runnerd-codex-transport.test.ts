@@ -1,5 +1,4 @@
 import {
-  appendFile,
   chmod,
   cp,
   mkdir,
@@ -971,13 +970,9 @@ it("requires ACPX command results to preserve the requested turn identity", () =
   ).toBe(true);
 });
 
-it.each([
-  { crashPoint: "before", historyMiB: 0 },
-  { crashPoint: "before", historyMiB: 65 },
-  { crashPoint: "after", historyMiB: 0 },
-])(
-  "retries external authority rotation after crashing $crashPoint the remote archive with $historyMiB MiB journal history",
-  async ({ crashPoint, historyMiB }) => {
+it.each(["before", "after"] as const)(
+  "retries external authority rotation after crashing %s the remote archive",
+  async (crashPoint) => {
     const root = await mkdtemp(join(tmpdir(), "runner-external-rotation-"));
     const priorIdentity = {
       runnerInstanceId: "runner-external-rotation",
@@ -1046,25 +1041,6 @@ it.each([
       await expect(stat(join(root, "control-plane"))).rejects.toMatchObject({
         code: "ENOENT",
       });
-
-      if (historyMiB > 0) {
-        const archives = await readdir(join(root, "authority-epochs"));
-        expect(archives).toHaveLength(1);
-        const archivedState = join(
-          root,
-          "authority-epochs",
-          archives[0]!,
-          "control-plane",
-          "control-plane-state.json",
-        );
-        const padding = Buffer.alloc(1024 * 1024, 0x20);
-        for (let index = 0; index < historyMiB; index += 1) {
-          await appendFile(archivedState, padding);
-        }
-        expect((await stat(archivedState)).size).toBeGreaterThan(
-          64 * 1024 * 1024,
-        );
-      }
 
       await expect(
         runnerdRecoveryInternals.rotateExternalAuthorityEpoch(
@@ -6382,123 +6358,138 @@ it.each([
   },
 );
 
-it("probes an exact-authority resume and confirms its live provider identity", async () => {
-  const stateDirectory = await mkdtemp(
-    join(tmpdir(), "runnerd-exact-authority-resume-"),
-  );
-  const identity = {
-    runnerInstanceId: "runner-exact-resume",
-    environmentLeaseId: "lease-exact-resume",
-    runId: "run-exact-resume",
-    normalizedSessionId: "session-exact-resume",
-    turnId: "turn-exact-resume",
-    itemId: "item-exact-resume",
-  };
-  const options = {
-    runnerBinary: defaultCapabilityRunnerdBinary(),
-    codexCommand: fakeCodex,
-    codexArgs: fakeCodexArgs(stateDirectory, "--durable-turn-ids"),
-    stateDirectory,
-    lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
-    prpIdentity: identity,
-  };
-  const first = createCapabilityRunnerdCodexTransport(options);
-  first.transport.setServerRequestHandler(async () => ({
-    success: true,
-    contentItems: [],
-  }));
-  let providerThread: { id: string; sessionId: string } | null = null;
-  try {
-    const opened = await first.transport.request("thread/start", {
-      cwd: tmpdir(),
-      dynamicTools: [],
-    });
-    const thread = opened.thread as Record<string, unknown>;
-    providerThread = {
-      id: String(thread.id),
-      sessionId: String(thread.sessionId),
+it.each([0, 3 * 1024 * 1024])(
+  "probes an exact-authority resume with %i extra journal bytes and confirms its live provider identity",
+  async (extraJournalBytes) => {
+    const stateDirectory = await mkdtemp(
+      join(tmpdir(), "runnerd-exact-authority-resume-"),
+    );
+    const identity = {
+      runnerInstanceId: "runner-exact-resume",
+      environmentLeaseId: "lease-exact-resume",
+      runId: "run-exact-resume",
+      normalizedSessionId: "session-exact-resume",
+      turnId: "turn-exact-resume",
+      itemId: "item-exact-resume",
     };
-  } finally {
-    await first.transport.close();
-  }
-  if (providerThread === null) {
-    throw new Error("exact-authority fixture did not return a provider thread");
-  }
+    const options = {
+      runnerBinary: defaultCapabilityRunnerdBinary(),
+      codexCommand: fakeCodex,
+      codexArgs: fakeCodexArgs(stateDirectory, "--durable-turn-ids"),
+      stateDirectory,
+      lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
+      prpIdentity: identity,
+    };
+    const first = createCapabilityRunnerdCodexTransport(options);
+    first.transport.setServerRequestHandler(async () => ({
+      success: true,
+      contentItems: [],
+    }));
+    let providerThread: { id: string; sessionId: string } | null = null;
+    try {
+      const opened = await first.transport.request("thread/start", {
+        cwd: tmpdir(),
+        dynamicTools: [],
+      });
+      const thread = opened.thread as Record<string, unknown>;
+      providerThread = {
+        id: String(thread.id),
+        sessionId: String(thread.sessionId),
+      };
+    } finally {
+      await first.transport.close();
+    }
+    if (providerThread === null) {
+      throw new Error(
+        "exact-authority fixture did not return a provider thread",
+      );
+    }
 
-  const statePath = join(
-    stateDirectory,
-    "control-plane",
-    "control-plane-state.json",
-  );
-  const beforeResume = JSON.parse(await readFile(statePath, "utf8")) as {
-    commands: Array<{ type: string }>;
-    committedEvents: Array<{ eventType: string }>;
-  };
-  expect(
-    beforeResume.commands.some((command) => command.type === "run.attach"),
-  ).toBe(false);
-  const priorResumeEvents = beforeResume.committedEvents.filter(
-    (event) => event.eventType === "session.resumed",
-  ).length;
-  const priorSnapshots = beforeResume.commands.filter(
-    (command) => command.type === "session.snapshot",
-  ).length;
-
-  const resumed = createCapabilityRunnerdCodexTransport({
-    ...options,
-    resumeProviderSession: {
-      driverSessionId: providerThread.id,
-      providerSessionId: providerThread.sessionId,
-    },
-  });
-  resumed.transport.setServerRequestHandler(async () => ({
-    success: true,
-    contentItems: [],
-  }));
-  try {
-    const read = await resumed.transport.request("thread/read", {});
-    expect(read.thread).toMatchObject(providerThread);
-    const afterResume = JSON.parse(await readFile(statePath, "utf8")) as {
-      commands: Array<{ commandId: string; type: string; status: string }>;
+    const statePath = join(
+      stateDirectory,
+      "control-plane",
+      "control-plane-state.json",
+    );
+    if (extraJournalBytes > 0) {
+      const journal = await readFile(statePath, "utf8");
+      const paddedJournal = `${journal}${" ".repeat(extraJournalBytes)}`;
+      await writeFile(statePath, paddedJournal);
+      expect(Buffer.byteLength(paddedJournal)).toBeGreaterThan(2 * 1024 * 1024);
+    }
+    const beforeResume = JSON.parse(await readFile(statePath, "utf8")) as {
+      commands: Array<{ type: string }>;
       committedEvents: Array<{ eventType: string }>;
     };
-    expect(afterResume.commands).toContainEqual(
-      expect.objectContaining({
-        commandId: expect.stringMatching(/^command_resume_probe_/),
-        type: "runner.drain",
-        status: "completed",
-      }),
-    );
-    expect(afterResume.commands).toContainEqual(
-      expect.objectContaining({
-        type: "session.snapshot",
-        status: "completed",
-      }),
-    );
     expect(
-      afterResume.commands.filter(
-        (command) => command.type === "session.snapshot",
-      ),
-    ).toHaveLength(priorSnapshots + 2);
-    // The authenticated snapshot above proves the live provider identity.
-    // Control-first dispatch may deliver that command before the independent
-    // session event is ingested. Still require exactly one durable event;
-    // don't mistake an immediate file read for an event-delivery barrier.
-    await vi.waitFor(async () => {
-      const delivered = JSON.parse(await readFile(statePath, "utf8")) as {
+      beforeResume.commands.some((command) => command.type === "run.attach"),
+    ).toBe(false);
+    const priorResumeEvents = beforeResume.committedEvents.filter(
+      (event) => event.eventType === "session.resumed",
+    ).length;
+    const priorSnapshots = beforeResume.commands.filter(
+      (command) => command.type === "session.snapshot",
+    ).length;
+
+    const resumed = createCapabilityRunnerdCodexTransport({
+      ...options,
+      resumeProviderSession: {
+        driverSessionId: providerThread.id,
+        providerSessionId: providerThread.sessionId,
+      },
+    });
+    resumed.transport.setServerRequestHandler(async () => ({
+      success: true,
+      contentItems: [],
+    }));
+    try {
+      const read = await resumed.transport.request("thread/read", {});
+      expect(read.thread).toMatchObject(providerThread);
+      const afterResume = JSON.parse(await readFile(statePath, "utf8")) as {
+        commands: Array<{ commandId: string; type: string; status: string }>;
         committedEvents: Array<{ eventType: string }>;
       };
+      expect(afterResume.commands).toContainEqual(
+        expect.objectContaining({
+          commandId: expect.stringMatching(/^command_resume_probe_/),
+          type: "runner.drain",
+          status: "completed",
+        }),
+      );
+      expect(afterResume.commands).toContainEqual(
+        expect.objectContaining({
+          type: "session.snapshot",
+          status: "completed",
+        }),
+      );
       expect(
-        delivered.committedEvents.filter(
-          (event) => event.eventType === "session.resumed",
+        afterResume.commands.filter(
+          (command) => command.type === "session.snapshot",
         ),
-      ).toHaveLength(priorResumeEvents + 1);
-    }, { timeout: 3_000, interval: 25 });
-  } finally {
-    await resumed.transport.close();
-    await rm(stateDirectory, { recursive: true, force: true });
-  }
-}, 30_000);
+      ).toHaveLength(priorSnapshots + 2);
+      // The authenticated snapshot above proves the live provider identity.
+      // Control-first dispatch may deliver that command before the independent
+      // session event is ingested. Still require exactly one durable event;
+      // don't mistake an immediate file read for an event-delivery barrier.
+      await vi.waitFor(
+        async () => {
+          const delivered = JSON.parse(await readFile(statePath, "utf8")) as {
+            committedEvents: Array<{ eventType: string }>;
+          };
+          expect(
+            delivered.committedEvents.filter(
+              (event) => event.eventType === "session.resumed",
+            ),
+          ).toHaveLength(priorResumeEvents + 1);
+        },
+        { timeout: 3_000, interval: 25 },
+      );
+    } finally {
+      await resumed.transport.close();
+      await rm(stateDirectory, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
 
 it("still fails closed when a real close grace period cannot fit a durable suspension round trip", async () => {
   const stateDirectory = await mkdtemp(

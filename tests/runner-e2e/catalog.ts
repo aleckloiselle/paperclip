@@ -1274,13 +1274,13 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     id: "daytona-journal-continuity",
     label: "Daytona Large Journal Continuity",
     manualOnly: true,
-    description: "Continue the same native session after a separate ordinary tool invocations and their output grow its durable journal beyond 2 MiB.",
+    description: "Continue the same native session after separate ordinary tool invocations and their output grow its durable journal beyond 2 MiB.",
     groups: ["daytona", "warm"],
     profiles: codexContinuityProfiles.filter((profile) => profile.id === "runner-codex"),
     environments: [daytonaWarmEnvironment],
     tasks: [daytonaLargeJournalTask],
     expectedMatrixSize: 1,
-    definitionMetadata: { version: 4, journalMinimumBytes: 2 * 1024 * 1024, toolInvocations: 240, outputBytesPerInvocation: 65019, scheduling: "explicit-only" },
+    definitionMetadata: { version: 4, journalMinimumBytes: 2 * 1024 * 1024, toolInvocations: 240, outputBytesPerInvocation: 65020, scheduling: "explicit-only" },
   },
 ] as const;
 

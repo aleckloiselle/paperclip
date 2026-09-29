@@ -71,8 +71,6 @@ const sourceUrl = new URL(
 const runner = (await import(sourceUrl.href)) as RunnerModule;
 
 export const DurablePrpControlPlane = runner.DurablePrpControlPlane;
-export const DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES =
-  runner.DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES;
 export const runnerCodexDynamicToolsFit = runner.runnerCodexDynamicToolsFit;
 export const inspectWarmRunTransition = runner.inspectWarmRunTransition;
 export const readRunnerdArtifactBinding = runner.readRunnerdArtifactBinding;

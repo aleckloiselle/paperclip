@@ -147,7 +147,7 @@ export async function admitExplicitNativeContinuation(input: {
   if (pendingInteraction || pendingApproval) return blocked("decision_pending", "A pending approval or question must be resolved before this message can start.");
 
   const sources: Run[] = [];
-  const stoppedSessions: Array<{ evidence: Record<string, unknown>; retire: () => Promise<boolean> }> = [];
+  const stoppedSessions: Array<{ evidence: Record<string, unknown>; retire: () => boolean }> = [];
   const cancelledStartupIds = new Set<string>();
   for (const action of actions) {
     const runId = action.evidence.runId ?? action.evidence.sourceRunId;
@@ -267,7 +267,7 @@ export async function admitExplicitNativeContinuation(input: {
     summary: null, exposeLowTrustRaw: false });
   if (input.dryRun) return { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}) };
   for (const stopped of stoppedSessions) {
-    if (!await stopped.retire()) return blocked("local_cleanup", "The previous provider cleanup changed. Your message is saved.");
+    if (!stopped.retire()) return blocked("local_cleanup", "The previous provider cleanup changed. Your message is saved.");
     await appendHeartbeatRunEvent(db, {
       companyId, runId: String(stopped.evidence.runId), agentId,
       eventType: "native.stopped_conversation_verified", stream: "system", level: "info",

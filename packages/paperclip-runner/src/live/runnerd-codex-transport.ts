@@ -21,7 +21,6 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readRunnerdStateFiles } from "./runnerd-state-reader.js";
 
 import type {
   CodexAppServerTransport,
@@ -49,7 +48,6 @@ import type {
 } from "../contracts/harness-driver.js";
 import {
   DurablePrpControlPlane,
-  DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES,
   durableRecoveryInternals,
   inspectWarmRunTransition,
   spawnRunner,
@@ -152,22 +150,17 @@ export function withCodexCollaborationRuntimeInstructions(
   return `${base}\n\n${CODEX_COLLABORATION_RUNTIME_INSTRUCTIONS}`;
 }
 
-async function readControlPlaneState(directory: string): Promise<Record<string, unknown>> {
-  const directoryIdentity = nativeRunnerDirectoryIdentity(directory);
+function readControlPlaneState(directory: string): Record<string, unknown> {
   const path = resolve(directory, "control-plane-state.json");
   const metadata = lstatSync(path);
   if (
     metadata.isSymbolicLink() ||
     !metadata.isFile() ||
-    metadata.size > DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES
+    metadata.size > 64 * 1024 * 1024
   ) {
     throw new Error("native_runner_control_plane_state_unsafe");
   }
-  const [snapshot] = await readRunnerdStateFiles([
-    { path, maximum: DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES },
-  ]);
-  assertNativeRunnerDirectoryIdentity(directory, directoryIdentity);
-  return snapshot!.state;
+  return record(JSON.parse(readFileSync(path, "utf8")));
 }
 
 function readRunnerState(path: string): Record<string, unknown> {
@@ -224,26 +217,6 @@ function assertRealDirectory(path: string): void {
   }
 }
 
-type NativeRunnerDirectoryIdentity = { dev: number; ino: number };
-
-function nativeRunnerDirectoryIdentity(
-  path: string,
-): NativeRunnerDirectoryIdentity {
-  assertRealDirectory(path);
-  const metadata = lstatSync(path);
-  return { dev: metadata.dev, ino: metadata.ino };
-}
-
-function assertNativeRunnerDirectoryIdentity(
-  path: string,
-  expected: NativeRunnerDirectoryIdentity,
-): void {
-  const current = nativeRunnerDirectoryIdentity(path);
-  if (current.dev !== expected.dev || current.ino !== expected.ino) {
-    throw new Error("native_runner_authority_archive_unsafe");
-  }
-}
-
 function quarantineLocalRuntimeState(root: string, reason: unknown): never {
   assertRealDirectory(root);
   const quarantine = resolve(
@@ -269,10 +242,10 @@ function authorityArchiveDirectory(
   return resolve(root, "authority-epochs", `epoch-${digest}`);
 }
 
-async function latestArchivedControlPlaneState(
+function latestArchivedControlPlaneState(
   root: string,
   desired: DurableRecoveryIdentity,
-): Promise<Record<string, unknown> | null> {
+): Record<string, unknown> | null {
   const archivesRoot = resolve(root, "authority-epochs");
   if (!existsSync(archivesRoot)) return null;
   assertRealDirectory(archivesRoot);
@@ -290,7 +263,7 @@ async function latestArchivedControlPlaneState(
     .sort((left, right) => right.modifiedAt - left.modifiedAt);
   for (const candidate of candidates) {
     assertRealDirectory(candidate.directory);
-    const state = await readControlPlaneState(candidate.directory);
+    const state = readControlPlaneState(candidate.directory);
     const identity = controlPlaneIdentity(state);
     if (
       identity.runnerInstanceId === desired.runnerInstanceId &&
@@ -420,7 +393,7 @@ async function rotateExternalAuthorityEpoch(
       throw new Error("native_runner_authority_archive_conflict");
     }
     const archivedIdentity = controlPlaneIdentity(
-      await readControlPlaneState(archivedControlPlane),
+      readControlPlaneState(archivedControlPlane),
     );
     if (!recoveryIdentityMatches(archivedIdentity, priorIdentity)) {
       throw new Error("native_runner_authority_archive_conflict");
@@ -2016,43 +1989,33 @@ function maintenanceProcessAbsent(pid: number): boolean {
   });
 }
 
-async function readMaintenanceState(root: string) {
+function readMaintenanceState(root: string) {
   assertRealDirectory(root);
   assertRealDirectory(resolve(root, "runner"));
   assertRealDirectory(resolve(root, "control-plane"));
-  const directories = [root, resolve(root, "runner"), resolve(root, "control-plane")]
-    .map((path) => ({ path, identity: nativeRunnerDirectoryIdentity(path) }));
-  const files = MAINTENANCE_STATE_FILES.map((file) => {
+  const bytes = MAINTENANCE_STATE_FILES.map((file) => {
     const path = resolve(root, file);
     const stat = lstatSync(path);
-    const maxBytes =
-      file === "control-plane/control-plane-state.json"
-        ? DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES
-        : 32 * 1024 * 1024;
-    if (
-      stat.isSymbolicLink() ||
-      !stat.isFile() ||
-      stat.size > maxBytes
-    )
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 32 * 1024 * 1024)
       throw maintenanceDenied();
-    return { path, maximum: maxBytes };
+    return readFileSync(path);
   });
-  const snapshots = await readRunnerdStateFiles(files);
-  try {
-    for (const directory of directories)
-      assertNativeRunnerDirectoryIdentity(directory.path, directory.identity);
-  } catch {
-    throw maintenanceDenied();
-  }
-  const [control, runner, provider] = snapshots.map((snapshot) => snapshot.state);
-  const hashes = snapshots.map((snapshot) => snapshot.sha256);
+  const [control, runner, provider] = bytes.map((value) =>
+    record(JSON.parse(value.toString("utf8"))),
+  );
   return {
     control: control!,
     runner: runner!,
     provider: provider!,
-    providerFingerprint: hashes[2]!,
+    providerFingerprint: createHash("sha256").update(bytes[2]!).digest("hex"),
     fingerprint: createHash("sha256")
-      .update(JSON.stringify(hashes))
+      .update(
+        JSON.stringify(
+          bytes.map((value) =>
+            createHash("sha256").update(value).digest("hex"),
+          ),
+        ),
+      )
       .digest("hex"),
   };
 }
@@ -2060,7 +2023,7 @@ async function readMaintenanceState(root: string) {
 /** An exact completed receipt is delivery evidence, never launch authority.
  * The caller must additionally own the preceding retired maintenance epoch. */
 function completedMaintenanceTerminalReceipt(
-  state: Awaited<ReturnType<typeof readMaintenanceState>>,
+  state: ReturnType<typeof readMaintenanceState>,
 ) {
   const pending = record(state.runner.pendingTerminalDelivery);
   const commands = state.control.commands as Array<Record<string, unknown>>;
@@ -2132,8 +2095,8 @@ function completedMaintenanceTerminalReceipt(
 }
 
 function completedMaintenanceTerminalReplayMatches(
-  before: Awaited<ReturnType<typeof readMaintenanceState>>,
-  after: Awaited<ReturnType<typeof readMaintenanceState>>,
+  before: ReturnType<typeof readMaintenanceState>,
+  after: ReturnType<typeof readMaintenanceState>,
 ) {
   const receipt = completedMaintenanceTerminalReceipt(before);
   if (!receipt) return false;
@@ -2160,7 +2123,7 @@ function completedMaintenanceTerminalReplayMatches(
 }
 
 function assertMaintenanceBinding(
-  state: Awaited<ReturnType<typeof readMaintenanceState>>,
+  state: ReturnType<typeof readMaintenanceState>,
   identity: DurableRecoveryIdentity,
   providerSessionId: string,
   allowRestoringOpen = false,
@@ -2191,16 +2154,15 @@ function assertMaintenanceBinding(
 
 /** A proof cannot be manufactured by JSON or reused after the activated
  * checkpoint or any of its exact process owners changes. */
-export async function retainedRunnerdCleanupProofIsCurrent(
+export function retainedRunnerdCleanupProofIsCurrent(
   proof: RetainedRunnerdCleanupProof,
-): Promise<boolean> {
+): boolean {
   const pids = retainedRunnerdCleanupProofs.get(proof);
   if (!pids || !pids.every(maintenanceProcessAbsent)) return false;
   try {
-    const state = await readMaintenanceState(proof.activationDirectory);
+    const state = readMaintenanceState(proof.activationDirectory);
     assertMaintenanceBinding(state, proof.identity, proof.providerSessionId);
     return (
-      pids.every(maintenanceProcessAbsent) &&
       state.fingerprint === proof.settledFingerprint &&
       state.runner.lifecycle === "suspended" &&
       state.runner.pendingTerminalDelivery == null &&
@@ -2265,7 +2227,7 @@ async function settleRetainedRunnerdSessionOwned(
     !input.providerSessionId
   )
     throw maintenanceDenied();
-  const initial = await readMaintenanceState(root);
+  const initial = readMaintenanceState(root);
   assertMaintenanceBinding(initial, input.identity, input.providerSessionId);
   if (initial.fingerprint !== input.sourceFingerprint)
     throw maintenanceDenied();
@@ -2404,8 +2366,7 @@ async function settleRetainedRunnerdSessionOwned(
   for (let epoch = 0; epoch < 4; epoch++) {
     await authorize();
     if (![...pids].every(maintenanceProcessAbsent)) throw maintenanceDenied();
-    const before = await readMaintenanceState(root);
-    if (![...pids].every(maintenanceProcessAbsent)) throw maintenanceDenied();
+    const before = readMaintenanceState(root);
     assertMaintenanceBinding(before, input.identity, input.providerSessionId);
     const terminalOnly = before.runner.pendingTerminalDelivery != null;
     const pendingTerminal = record(before.runner.pendingTerminalDelivery);
@@ -2567,8 +2528,7 @@ async function settleRetainedRunnerdSessionOwned(
       }
       await core.start();
       await authorize();
-      epochIdentity.initialFingerprint = (await readMaintenanceState(root)).fingerprint;
-      if (![...pids].every(maintenanceProcessAbsent)) throw maintenanceDenied();
+      epochIdentity.initialFingerprint = readMaintenanceState(root).fingerprint;
       await bounded(
         input.recordEpoch({ ...epochIdentity, phase: "launch_intent" }),
       );
@@ -2627,8 +2587,7 @@ async function settleRetainedRunnerdSessionOwned(
       let drainQueued = false;
       while (!exited) {
         await authorize();
-        const state = await readMaintenanceState(root);
-        if (exited) break;
+        const state = readMaintenanceState(root);
         assertMaintenanceBinding(
           state,
           input.identity,
@@ -2690,9 +2649,7 @@ async function settleRetainedRunnerdSessionOwned(
           const result = await handle.completion;
           if (!maintenanceProcessAbsent(spawnedReceipt.pid))
             throw maintenanceDenied();
-          const finalFingerprint = (await readMaintenanceState(root)).fingerprint;
-          if (!maintenanceProcessAbsent(spawnedReceipt.pid))
-            throw maintenanceDenied();
+          const finalFingerprint = readMaintenanceState(root).fingerprint;
           await bounded(
             input.recordEpoch({
               ...spawnedReceipt,
@@ -2750,7 +2707,7 @@ async function settleRetainedRunnerdSessionOwned(
     // Retirement itself may await durable authorization callbacks. It proves
     // process exit, not permission to publish a reusable cleanup proof.
     await authorize();
-    const settled = await readMaintenanceState(root);
+    const settled = readMaintenanceState(root);
     assertMaintenanceBinding(settled, input.identity, input.providerSessionId);
     if (settled.runner.lifecycle !== "suspended") throw maintenanceDenied();
     if (terminalOnly) {
@@ -4893,16 +4850,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     let controlPlaneState: Record<string, unknown> | null;
     try {
       controlPlaneState = existsSync(controlPlaneStatePath)
-        ? await readControlPlaneState(controlPlaneDirectory)
+        ? readControlPlaneState(controlPlaneDirectory)
         : null;
     } catch (error) {
       if (localProvider && localStateOwner && !hasRunnerWarmBoundary) {
-        if (
-          error instanceof Error &&
-          error.message.startsWith("native_runner_state_worker_")
-        ) {
-          throw error;
-        }
         quarantineLocalRuntimeState(this.#root, error);
       }
       throw error;
@@ -5023,7 +4974,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       if (!localProvider) {
         throw new Error("PRP provider resume state is unavailable");
       }
-      const archivedState = await latestArchivedControlPlaneState(
+      const archivedState = latestArchivedControlPlaneState(
         this.#root,
         desiredIdentity,
       );

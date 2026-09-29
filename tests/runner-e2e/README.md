@@ -251,7 +251,7 @@ sandbox rather than waiting for Daytona's idle timeout.
 It reuses the three-turn warm workflow with 240 separate ordinary execution-tool calls, each printing a bounded 65 KB
 synthetic sample through the real provider. Before the first browser follow-up,
 a read-only controller journal oracle requires the exact completed run's journal
-to exceed two MiB. Only byte counts enter evidence. No runner state or database
+to exceed two MiB. Only byte and call counts enter evidence. No runner state or database
 is injected or modified. The usual workspace, sandbox, provider, process,
 three-run, screenshot, timeout, billing, and cleanup assertions remain required;
 `--all` excludes this stress case.

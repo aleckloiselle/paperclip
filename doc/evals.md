@@ -65,12 +65,6 @@ harness are under `tests/runner-e2e`; the package scripts are `test:e2e:runner`,
 the server and embedded database, creates the company/agent/task through the
 real APIs, drives Chromium, and invokes the selected local or Daytona runner.
 
-The explicit-only `daytona-journal-continuity` Product E2E cell exercises
-continuation after 240 separate ordinary execution-tool calls grow the durable
-control-plane journal past two MiB. Its size oracle is read-only and retains
-only byte counts; see the
-[Product E2E fixture](../tests/runner-e2e/README.md).
-
 The explicit-only `agent-chat-hardening` Product E2E suite covers native chat
 recovery, hiring, status evidence, and review handoff on local and selected warm
 Daytona paths. Its [fixture contract](../tests/runner-e2e/README.md) distinguishes

@@ -12273,7 +12273,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       await failedNativeRetryCoordinator(tx, run, source.issueId);
     if (retiredOwner) {
       if (
-        !(await nativePreProviderRetryAfterCleanupStateIsSafe({
+        !nativePreProviderRetryAfterCleanupStateIsSafe({
           failedExecution: run.runnerProfileJson?.nativeExecutionInput,
           retiredExecution:
             retiredOwner.predecessor.runnerProfileJson?.nativeExecutionInput,
@@ -12289,7 +12289,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           processPid: run.processPid!,
           processGroupId: run.processGroupId!,
           receipt: retiredOwner.receipt,
-        }))
+        })
       )
         throw failedChatRetryDenied();
       return;
@@ -12303,7 +12303,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       (checkpoint?.providerSessionId != null &&
         (typeof checkpoint.providerSessionId !== "string" ||
           checkpoint.providerSessionId.trim().length === 0)) ||
-      !(await nativeFailedRunRetryStateIsSafe({
+      !nativeFailedRunRetryStateIsSafe({
         execution: run.runnerProfileJson?.nativeExecutionInput,
         companyId,
         issueId: source.issueId,
@@ -12325,7 +12325,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           | "bootstrap_retry"
           | "exact_checkpoint_resume",
         allowVerifiedBackup: leases.length > 0,
-      }))
+      })
     )
       throw failedChatRetryDenied();
   }

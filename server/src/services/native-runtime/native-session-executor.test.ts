@@ -1,4 +1,3 @@
-import * as nativeJournalProof from "./native-journal-projection-async.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import {
@@ -7,7 +6,6 @@ import {
   lstat,
   mkdir,
   mkdtemp,
-  open,
   readdir,
   realpath,
   readFile,
@@ -45,8 +43,6 @@ import { DatabaseSync } from "node:sqlite";
 import { nativeSha256 } from "./canonical.js";
 import * as noLaunchProofModule from "./native-maintenance-no-launch.js";
 import {
-  DurablePrpControlPlane,
-  DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES,
   NativeSessionCleanupQuarantinedError,
   NativeProviderTerminalFailure,
   NativeSessionProtocolIntegrityError,
@@ -956,7 +952,7 @@ describe("native incomplete-bootstrap evidence", () => {
     };
     try {
       await writeFile(statePath, JSON.stringify(base));
-      expect((await runnerdStateProvesIncompleteBootstrap(root))).toBe(true);
+      expect(runnerdStateProvesIncompleteBootstrap(root)).toBe(true);
 
       for (const ambiguous of [
         { ...base, connectionCount: 1 },
@@ -971,7 +967,7 @@ describe("native incomplete-bootstrap evidence", () => {
         },
       ]) {
         await writeFile(statePath, JSON.stringify(ambiguous));
-        expect((await runnerdStateProvesIncompleteBootstrap(root))).toBe(false);
+        expect(runnerdStateProvesIncompleteBootstrap(root)).toBe(false);
       }
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -3201,42 +3197,6 @@ describe("retained native cleanup activation", () => {
       );
       for (const [file, data] of source)
         await writeFile(join(quarantine, file), JSON.stringify(data));
-      if (mode === "empty_root") {
-        const projectedHistory: Record<string, unknown> & { commands: Array<Record<string, unknown>> } = structuredClone(source[0][1]);
-        const output = "x".repeat(384 * 1024);
-        for (let index = 0; index < 24; index++) {
-          const ordinary = {
-            type: "semantic_tool.result", status: "completed",
-            payload: { callId: `read-${index}`, operationId: "paperclip_read", input: { output }, correlation,
-              sourceEventId: `read-input-${index}`, sourceEventType: "semantic_tool.input", isError: false },
-            result: { result: { callId: `read-${index}` } },
-          };
-          expect(Buffer.byteLength(JSON.stringify(ordinary))).toBeLessThan(1024 * 1024 - 4096);
-          projectedHistory.commands.push(ordinary);
-        }
-        const controlPath = join(quarantine, "control-plane/control-plane-state.json");
-        const bytes = JSON.stringify(projectedHistory);
-        expect(Buffer.byteLength(bytes)).toBeGreaterThan(8 * 1024 * 1024);
-        await writeFile(controlPath, bytes);
-        try {
-          const proof = await nativeJournalProof.readNativeJournalProjection(controlPath);
-          const matches = (control: Record<string, unknown>) => retainedNativeCleanupJournalMatches({
-            run, execution, accepted, control, providerSessionId: "exact-thread", providerAccountSessionId,
-            persistedEvents: [identityRow],
-          });
-          expect(matches(proof.value as Record<string, unknown>)).toBe(true);
-          for (const corrupt of ["input", "correlation"] as const) {
-            const changed = structuredClone(proof.value) as typeof projectedHistory;
-            const finish = changed.commands.find(command => (command.payload as Record<string, unknown> | undefined)?.operationId === "paperclip_finish")!;
-            const payload = finish.payload as { input: Record<string, unknown>; correlation: { runId: string } };
-            if (corrupt === "input") payload.input.summary = "changed";
-            else payload.correlation.runId = "foreign-run";
-            expect(matches(changed)).toBe(false);
-          }
-        } finally {
-          await writeFile(controlPath, JSON.stringify(source[0][1]));
-        }
-      }
       await mkdir(join(quarantine, "codex-home/sessions"), {
         recursive: true,
       });
@@ -4185,7 +4145,7 @@ describe("stopped native conversation physical cleanup", () => {
         expect(proof).not.toBeNull();
         if (mode === "changed_state") await writeFile(runnerPath, "{}");
         const kill = mode === "changed_pid" ? vi.spyOn(process, "kill").mockReturnValue(true) : null;
-        try { expect(await proof!.retire()).toBe(["stopped", "replacement", "normalized_session_receipt"].includes(mode)); } finally { kill?.mockRestore(); }
+        try { expect(proof!.retire()).toBe(["stopped", "replacement", "normalized_session_receipt"].includes(mode)); } finally { kill?.mockRestore(); }
         expect(await readFile(join(root, `runner/${provider}-provider-state.json`), "utf8")).toBe(JSON.stringify(providerState));
       } else expect(proof).toBeNull();
     } finally {
@@ -4210,8 +4170,6 @@ describe("explicit failed native retry physical evidence", () => {
     "active_provider",
     "ambiguous_provider",
     "live_pid",
-    "owner_started_during_journal_read",
-    "directory_replaced_during_journal_read",
     "symlink",
     "bootstrap",
     "quarantined_bootstrap",
@@ -4270,8 +4228,6 @@ describe("explicit failed native retry physical evidence", () => {
       "distinct_account",
       "null_account",
     ].includes(kind);
-    let restoreRead: (() => void) | undefined;
-    let restoreKill: (() => void) | undefined;
     try {
       const identity = {
         runId: execution.binding.runId,
@@ -4335,32 +4291,13 @@ describe("explicit failed native retry physical evidence", () => {
         );
       }
       const before = await readdir(stateBase);
-      if (kind === "owner_started_during_journal_read" || kind === "directory_replaced_during_journal_read") {
-        const read = nativeJournalProof.readNativeJournalProjection;
-        let replacements = 0;
-        const spy = vi.spyOn(nativeJournalProof, "readNativeJournalProjection").mockImplementation(async (...args) => {
-          const proof = await read(...args);
-          if (kind === "owner_started_during_journal_read") {
-            const kill = vi.spyOn(process, "kill").mockReturnValue(true);
-            restoreKill = () => kill.mockRestore();
-          } else {
-            const control = join(root, "control-plane");
-            const archived = join(root, `changed-control-${replacements++}`);
-            await rename(control, archived);
-            await mkdir(control);
-            await writeFile(join(control, "control-plane-state.json"), await readFile(join(archived, "control-plane-state.json")));
-          }
-          return proof;
-        });
-        restoreRead = () => spy.mockRestore();
-      }
       const retryInput = {
         execution,
         ...execution.binding,
         nativeSessionId: execution.session.normalizedSessionId!,
         runnerInstanceId:
           kind === "wrong_runner" ? "another-runner" : "runner-retry",
-        processPid: kind === "live_pid" ? process.pid : kind === "owner_started_during_journal_read" ? 99_999_999 : null,
+        processPid: kind === "live_pid" ? process.pid : null,
         providerSessionId: expectedThread,
         providerBackendSessionId: expectedAccount,
         processGroupId: null,
@@ -4370,7 +4307,7 @@ describe("explicit failed native retry physical evidence", () => {
         allowVerifiedBackup: false,
       };
       expect
-        .soft((await nativeFailedRunRetryStateIsSafe(retryInput)))
+        .soft(nativeFailedRunRetryStateIsSafe(retryInput))
         .toBe(retryable || kind === "bootstrap");
       if (!bootstrap && kind !== "symlink") {
         const files = [
@@ -4419,26 +4356,26 @@ describe("explicit failed native retry physical evidence", () => {
           processGroupId: 99_999_999,
           receipt,
         };
-        expect((await nativePreProviderRetryAfterCleanupStateIsSafe(input))).toBe(
+        expect(nativePreProviderRetryAfterCleanupStateIsSafe(input)).toBe(
           retryable,
         );
         expect(
-          (await nativePreProviderRetryAfterCleanupStateIsSafe({
+          nativePreProviderRetryAfterCleanupStateIsSafe({
             ...input,
             receipt: { ...receipt, settledFingerprint: "changed" },
-          })),
+          }),
         ).toBe(false);
         expect(
-          (await nativePreProviderRetryAfterCleanupStateIsSafe({
+          nativePreProviderRetryAfterCleanupStateIsSafe({
             ...input,
             receipt: { ...receipt, sourceFingerprint: undefined },
-          })),
+          }),
         ).toBe(false);
         expect(
-          (await nativePreProviderRetryAfterCleanupStateIsSafe({
+          nativePreProviderRetryAfterCleanupStateIsSafe({
             ...input,
             receipt: { ...receipt, requestId: "" },
-          })),
+          }),
         ).toBe(false);
       }
       expect(await readdir(stateBase)).toEqual(before);
@@ -4447,8 +4384,6 @@ describe("explicit failed native retry physical evidence", () => {
           await access(join(root, "control-plane", "control-plane-state.json")),
         ).toBeUndefined();
     } finally {
-      restoreRead?.();
-      restoreKill?.();
       if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
       else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
       await rm(stateBase, { recursive: true, force: true });
@@ -9158,132 +9093,6 @@ describe("runnerd provider runtime wiring", () => {
     },
   );
 
-  it.each([
-    { commandCount: 4, fault: null },
-    { commandCount: 24, fault: null },
-    { commandCount: 88, fault: null },
-    { commandCount: 4, fault: "oversized" },
-    { commandCount: 4, fault: "wrong identity" },
-    { commandCount: 4, fault: "native_journal_worker_busy" },
-    { commandCount: 4, fault: "native_journal_worker_timeout" },
-  ])(
-    "admits a valid large control-plane journal while preserving bounds and identity ($commandCount commands, $fault)",
-    async ({ commandCount, fault }) => {
-      const stateBase = await mkdtemp(join(tmpdir(), "paperclip-large-prp-journal-"));
-      const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
-      process.env.PAPERCLIP_RUNNER_STATE_DIR = stateBase;
-      const prior = {
-        ...execution,
-        binding: { ...execution.binding, runId: "large-journal-prior" },
-      } as NativeExecutionInputV1;
-      const current = {
-        ...prior,
-        binding: { ...prior.binding, runId: "large-journal-next" },
-      } as NativeExecutionInputV1;
-      const identity = {
-        runId: prior.binding.runId,
-        normalizedSessionId: prior.session.normalizedSessionId!,
-        runnerInstanceId: "large-journal-runner",
-        environmentLeaseId: "large-journal-lease",
-        turnId: "large-journal-turn",
-        itemId: "large-journal-item",
-      };
-      const remoteTarget = {
-        kind: "remote", transport: "sandbox", providerKey: "daytona",
-        leaseId: identity.environmentLeaseId,
-        remoteCwd: "/home/daytona/paperclip-workspace",
-        runner: { execute: vi.fn() },
-      } as never;
-      const priorRunDb = {
-        select: () => ({ from: () => ({ where: () => ({ limit: () => Promise.resolve([{
-          status: "succeeded", runnerProfileJson: { nativeExecutionInput: prior },
-        }]) }) }) }),
-      } as unknown as Db;
-      let restoreRead: (() => void) | undefined;
-      try {
-        state.createBackend.mockClear();
-        state.createTransport.mockClear();
-        await createRunnerdBackend({
-          db: leaseDb(prior), execution: prior,
-          runnerInstanceId: identity.runnerInstanceId, runnerExecutionTarget: remoteTarget,
-        });
-        state.createBackend.mock.calls[0]![1].codexTransportFactory!();
-        const root = state.createTransport.mock.calls[0]![0].stateDirectory!;
-        const options = {
-          stateDirectory: join(root, "control-plane"), identity,
-          expectedRunnerVersion: "0.3.0", expectedRunnerDigest: `sha256:${"a".repeat(64)}`,
-        };
-        // The real writer accepts and reloads these individually bounded commands.
-        // Accumulated history must not invalidate an otherwise identical session.
-        const core = new DurablePrpControlPlane(options);
-        for (let index = 0; index < commandCount; index += 1) {
-          core.queueCommand("turn.start", { text: "x".repeat(768 * 1024) }, `large-command-${index}`);
-        }
-        for (const command of core.store.state.commands) command.status = "completed";
-        core.issueBootstrapTicket();
-        expect(new DurablePrpControlPlane(options).store.state.commands).toHaveLength(commandCount);
-        const controlPath = join(root, "control-plane", "control-plane-state.json");
-        const controlBytes = await readFile(controlPath);
-        // Master raised the former 2 MiB identity limit to 64 MiB. Exercise
-        // that boundary too, while remaining inside the writer's 192 MiB limit.
-        expect(controlBytes.byteLength).toBeGreaterThan((commandCount === 4 ? 2 : commandCount === 24 ? 16 : 64) * 1024 * 1024);
-        await mkdir(join(root, "runner"), { recursive: true });
-        await writeFile(join(root, "runner", "runner-state.json"), JSON.stringify(durableRunnerState(identity, "suspended")));
-        if (fault === "oversized") {
-          await truncate(controlPath, DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES + 1);
-        } else if (fault === "wrong identity") {
-          await writeFile(controlPath, JSON.stringify({
-            ...core.store.state,
-            identity: { ...identity, normalizedSessionId: "unrelated-session" },
-          }));
-        }
-        state.createBackend.mockClear();
-        state.createTransport.mockClear();
-        if (fault?.startsWith("native_journal_worker_")) {
-          const read = nativeJournalProof.readNativeJournalProjection;
-          const spy = vi.spyOn(nativeJournalProof, "readNativeJournalProjection").mockImplementation(async (path, purpose) => {
-            if (purpose === "identity") throw new Error(fault);
-            return read(path, purpose);
-          });
-          restoreRead = () => spy.mockRestore();
-        }
-        const continuation = createRunnerdBackend({
-          db: priorRunDb, execution: current, runnerInstanceId: "new-heartbeat-runner",
-          runnerExecutionTarget: remoteTarget,
-        });
-        if (fault?.startsWith("native_journal_worker_")) {
-          await expect(continuation).rejects.toThrow(fault);
-          expect(state.createBackend).not.toHaveBeenCalled();
-          expect(state.createTransport).not.toHaveBeenCalled();
-          expect((await readFile(controlPath)).equals(controlBytes)).toBe(true);
-          await expect(access(join(stateBase, "quarantine"))).rejects.toThrow();
-          return;
-        }
-        if (fault !== null) {
-          await expect(continuation).rejects.toThrow("runner_state_identity_mismatch");
-          expect(state.createBackend).not.toHaveBeenCalled();
-          expect(state.createTransport).not.toHaveBeenCalled();
-          return;
-        }
-        await expect(continuation).resolves.toBeDefined();
-        state.createBackend.mock.calls[0]![1].codexTransportFactory!();
-        expect(state.createTransport.mock.calls[0]![0].prpIdentity).toMatchObject({
-          runId: current.binding.runId,
-          runnerInstanceId: identity.runnerInstanceId,
-          environmentLeaseId: identity.environmentLeaseId,
-        });
-        expect((await readFile(controlPath)).equals(controlBytes)).toBe(true);
-        await expect(access(join(stateBase, "quarantine"))).rejects.toThrow();
-      } finally {
-        restoreRead?.();
-        if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
-        else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
-        await rm(stateBase, { recursive: true, force: true });
-      }
-    },
-    60_000,
-  );
-
   it("quarantines legacy prior-run state only after the database proves a terminal owner in the same full scope", async () => {
     const stateBase = await mkdtemp(
       join(tmpdir(), "paperclip-legacy-terminal-unsuspended-state-"),
@@ -9482,7 +9291,6 @@ describe("runnerd provider runtime wiring", () => {
     "large control plane",
     "empty retry shell",
     "unsuspended current",
-    "large control journal",
     "live runner",
     "live group",
     "missing process identity",
@@ -9502,7 +9310,6 @@ describe("runnerd provider runtime wiring", () => {
     "ambiguous turn start",
     "state symlink",
     "newer provider checkpoint",
-    "directory replaced during final hash",
   ])(
     "automatically recovers only a proven settled local session: %s",
     async (scenario) => {
@@ -9551,7 +9358,6 @@ describe("runnerd provider runtime wiring", () => {
         });
       }
       const onLog = vi.fn(async () => {});
-      let finalHashSpy: ReturnType<typeof vi.spyOn> | undefined;
       const profile = {
         nativeExecutionInput:
           scenario === "wrong scope"
@@ -9673,17 +9479,13 @@ describe("runnerd provider runtime wiring", () => {
             join(root, "control-plane", "control-plane-state.json"),
             JSON.stringify({
               ...durableControlPlaneState(identity),
-              commands: Array.from(
-                { length: scenario === "large control journal" ? 24 : 1 },
-                () => ({
+              commands: [
+                {
                   type: "turn.start",
-                  payload: scenario === "large control journal"
-                    ? { text: "x".repeat(768 * 1024) }
-                    : {},
                   status:
                     scenario === "pending command" ? "pending" : "completed",
-                }),
-              ),
+                },
+              ],
               committedEvents: [
                 ...(scenario === "large control plane"
                   ? Array.from({ length: 2048 }, () => ({
@@ -9704,20 +9506,6 @@ describe("runnerd provider runtime wiring", () => {
           );
         };
         await writeCandidate(candidate);
-        if (scenario === "directory replaced during final hash") {
-          const scan = nativeJournalProof.scanNativeStateFile;
-          let reads = 0;
-          finalHashSpy = vi.spyOn(nativeJournalProof, "scanNativeStateFile").mockImplementation(async (...args) => {
-            const proof = await scan(...args);
-            if (args[0] === join(candidate, "control-plane", "control-plane-state.json") && ++reads === 2) {
-              const bytes = await readFile(args[0]);
-              await rename(join(candidate, "control-plane"), join(candidate, "original-control-plane"));
-              await mkdir(join(candidate, "control-plane"));
-              await writeFile(args[0], bytes);
-            }
-            return proof;
-          });
-        }
         if (scenario === "state symlink") {
           await rename(
             join(candidate, "runner", "runner-state.json"),
@@ -9747,7 +9535,6 @@ describe("runnerd provider runtime wiring", () => {
           "large control plane",
           "empty retry shell",
           "unsuspended current",
-          "large control journal",
           "active goal",
         ].includes(scenario);
         if (shouldRecover) {
@@ -9806,7 +9593,6 @@ describe("runnerd provider runtime wiring", () => {
           expect(state.createBackend).not.toHaveBeenCalled();
         }
       } finally {
-        finalHashSpy?.mockRestore();
         processKill.mockRestore();
         if (previousStateDirectory === undefined)
           delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
@@ -10324,17 +10110,10 @@ describe("runnerd provider runtime wiring", () => {
           };
           // Valid JSON and valid ready authority: only the byte bound rejects
           // this file. Malformed sparse padding would not test that boundary.
-          const oversizedPath = join(scopedRoot, "control-plane", "control-plane-state.json");
-          await writeFile(oversizedPath, JSON.stringify(durableControlPlaneState(identity)));
-          const oversizedFile = await open(oversizedPath, "a");
-          try {
-            const padding = Buffer.alloc(1024 * 1024, 32);
-            for (let written = 0; written < DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES; written += padding.length) {
-              await oversizedFile.write(padding);
-            }
-          } finally {
-            await oversizedFile.close();
-          }
+          await writeFile(
+            join(scopedRoot, "control-plane", "control-plane-state.json"),
+            JSON.stringify(durableControlPlaneState(identity)).padEnd(64 * 1024 * 1024 + 1, " "),
+          );
           await mkdir(join(scopedRoot, "runner"), { recursive: true });
           await writeFile(
             join(scopedRoot, "runner", "runner-state.json"),

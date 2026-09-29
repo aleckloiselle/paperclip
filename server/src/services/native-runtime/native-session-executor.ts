@@ -3,7 +3,6 @@ import { readLocalAiCredentialFile } from "../local-ai-credential-file.js";
 import { prepareGrokRunnerCredentials } from "./grok-runner-credentials.js";
 import { copyBackGrokAuth } from "@paperclipai/adapter-grok-local/server";
 
-import { readNativeJournalProjection, scanNativeStateFile, nativeStateFileIncludes, nativeStateBase64Fingerprint } from "./native-journal-projection-async.js";
 import {
   isSupportedRemoteCodexVersion,
   parseCodexCliVersion,
@@ -69,7 +68,6 @@ import type {
   PrpStructuredRunResult,
 } from "../../vendor/paperclip-runner/index.js";
 import {
-  DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES,
   NativeProviderTerminalFailure,
   NativeSessionCleanupQuarantinedError,
   NativeSessionProtocolIntegrityError,
@@ -283,6 +281,10 @@ export async function detachNativeSessionsForRestart(
 const MAX_REMOTE_CHECKPOINT_ARCHIVE_BYTES = 64 * 1024 * 1024;
 const MAX_REMOTE_CHECKPOINT_EXPANDED_BYTES = 64 * 1024 * 1024;
 const MAX_REMOTE_CHECKPOINT_ENTRIES = 20_000;
+// Identity is read from the complete control-plane state, including its PRP
+// event window. Match the transport's bounded reader so verbose valid turns do
+// not lose continuation authority merely because their history exceeds 2 MiB.
+const NATIVE_CONTROL_PLANE_STATE_MAX_BYTES = 64 * 1024 * 1024;
 const NATIVE_RUNNER_STATE_MAX_BYTES = 16 * 1024 * 1024;
 const NATIVE_WARM_CHECKPOINT_MAX_BYTES = 8 * 1024 * 1024;
 const CODEX_HOME_NON_PERSISTENT_ENTRIES = [
@@ -1679,19 +1681,17 @@ function legacyRunnerdStateRoot(execution: NativeExecutionInput): string {
   );
 }
 
-async function migrateLegacyRunnerdStateRoot(input: {
+function migrateLegacyRunnerdStateRoot(input: {
   legacy: string;
   scoped: string;
   execution: NativeExecutionInput;
   verifiedPriorRunId?: string;
-}): Promise<string | null> {
+}): string | null {
   if (!existsSync(input.legacy)) return null;
   if (!isSafeNativeStateDirectory(input.legacy)) {
     throw new Error("runner_state_directory_unsafe");
   }
-  const legacyDirectoryIdentity = nativeStateDirectoryIdentity(input.legacy);
-  const legacyIdentity = (await readRunnerdDurableIdentity(input.legacy));
-  assertNativeStateDirectoryIdentity(input.legacy, legacyDirectoryIdentity);
+  const legacyIdentity = readRunnerdDurableIdentity(input.legacy);
   const exactRun = durableIdentityMatchesExecution(
     legacyIdentity,
     input.execution,
@@ -1727,7 +1727,7 @@ async function migrateLegacyRunnerdStateRoot(input: {
     // directory is authoritative once it exists; otherwise preserve the
     // original migration failure rather than silently starting empty state.
     if (!isSafeNativeStateDirectory(input.scoped)) throw error;
-    const scopedIdentity = (await readRunnerdDurableIdentity(input.scoped));
+    const scopedIdentity = readRunnerdDurableIdentity(input.scoped);
     const exactScopedRun = durableIdentityMatchesExecution(
       scopedIdentity,
       input.execution,
@@ -1837,13 +1837,7 @@ const CLEANUP_CANONICAL_FILES = [
 ] as const;
 const CLEANUP_ACTIVATION_FILE = "cleanup-activation.json";
 
-function nativeStateFileMaxBytes(relativePath: string): number {
-  return relativePath === "control-plane/control-plane-state.json"
-    ? DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES
-    : NATIVE_RUNNER_STATE_MAX_BYTES;
-}
-
-async function cleanupStateSnapshot(root: string, providerFile = "codex-provider-state.json") {
+function cleanupStateSnapshot(root: string, providerFile = "codex-provider-state.json") {
   if (
     ![root, resolve(root, "runner"), resolve(root, "control-plane")].every(
       isSafeNativeStateDirectory,
@@ -1851,17 +1845,22 @@ async function cleanupStateSnapshot(root: string, providerFile = "codex-provider
   ) {
     throw new Error("native_cleanup_maintenance_unproven");
   }
-  const directoryIdentities = [root, resolve(root, "runner"), resolve(root, "control-plane")]
-    .map(path => ({ path, identity: nativeStateDirectoryIdentity(path) }));
   const files = [...CLEANUP_CANONICAL_FILES.slice(0, 2), `runner/${providerFile}`];
-  const controlProof = (await readNativeJournalProjection(resolve(root, files[0]!)));
-  for (const directory of directoryIdentities) assertNativeStateDirectoryIdentity(directory.path, directory.identity);
-  const bytes = files.slice(1).map((file) =>
-    readBoundedNativeFile(resolve(root, file), NATIVE_RUNNER_STATE_MAX_BYTES, "native_cleanup_maintenance_unproven"),
+  const bytes = files.map((file) =>
+    readBoundedNativeFile(
+      resolve(root, file),
+      file === "control-plane/control-plane-state.json"
+        ? NATIVE_CONTROL_PLANE_STATE_MAX_BYTES
+        : NATIVE_RUNNER_STATE_MAX_BYTES,
+      "native_cleanup_maintenance_unproven",
+    ),
   );
-  const control = record(controlProof.value);
-  const [runner, provider] = bytes.map(value => record(JSON.parse(value.toString("utf8"))));
-  const fileSha256 = [controlProof.sha256, ...bytes.map(value => createHash("sha256").update(value).digest("hex"))] as [string, string, string];
+  const [control, runner, provider] = bytes.map((value) =>
+    record(JSON.parse(value.toString("utf8"))),
+  );
+  const fileSha256 = bytes.map((value) =>
+    createHash("sha256").update(value).digest("hex"),
+  ) as [string, string, string];
   return {
     control: control!,
     runner: runner!,
@@ -2456,7 +2455,7 @@ export function rebaseRetainedNativeCleanupProviderHome(
 export async function verifyStoppedNativeSessionForContinuation(
   db: Db,
   run: typeof heartbeatRuns.$inferSelect,
-): Promise<{ evidence: Record<string, unknown>; retire: () => Promise<boolean> } | null> {
+): Promise<{ evidence: Record<string, unknown>; retire: () => boolean } | null> {
   try {
     if (run.runtimeMode !== "native" || !["failed", "cancelled", "interrupted", "timed_out"].includes(run.status) ||
         !run.finishedAt || !run.nativeIssueId || !run.nativeSessionId || !run.runnerInstanceId) return null;
@@ -2477,7 +2476,7 @@ export async function verifyStoppedNativeSessionForContinuation(
     if (!stopped) return null;
     const root = scopedRunnerdStateRoot(execution);
     const providerFile = runnerProviderStateFilename(execution);
-    const snapshot = (await cleanupStateSnapshot(root, providerFile));
+    const snapshot = cleanupStateSnapshot(root, providerFile);
     const identity = record(snapshot.control.identity);
     if (!durableIdentityMatchesExecution(identity, execution) || identity.runnerInstanceId !== run.runnerInstanceId ||
         !["runnerInstanceId", "environmentLeaseId", "runId", "normalizedSessionId", "turnId", "itemId"].every(key =>
@@ -2543,14 +2542,14 @@ export async function verifyStoppedNativeSessionForContinuation(
       if (!cleanupProcessAbsent(pid)) return null;
       providerPids.add(pid);
     }
-    const unchanged = async () => (await cleanupStateSnapshot(root, providerFile)).fingerprint === snapshot.fingerprint &&
-      idle() && cleanupProcessAbsent(stopped.processPid) && [...providerPids].every(cleanupProcessAbsent);
+    const unchanged = () => idle() && cleanupProcessAbsent(stopped.processPid) &&
+      [...providerPids].every(cleanupProcessAbsent) && cleanupStateSnapshot(root, providerFile).fingerprint === snapshot.fingerprint;
     return {
       evidence: { schema: "paperclip.stopped_native_conversation.v1", runId: run.id,
         nativeSessionId: run.nativeSessionId, runnerInstanceId: run.runnerInstanceId,
         processPid: stopped.processPid, providerPids: [...providerPids], stateFingerprint: snapshot.fingerprint },
-      retire: async () => {
-        try { return await unchanged() && completeTerminatedLocalNativeSessionCleanup({
+      retire: () => {
+        try { return unchanged() && completeTerminatedLocalNativeSessionCleanup({
           companyId: run.companyId, runId: run.id, runnerInstanceId: run.runnerInstanceId!,
         }); } catch { return false; }
       },
@@ -2564,7 +2563,7 @@ export async function verifyStoppedNativeSessionForContinuation(
 export async function verifyStoppedNativeSessionForReplacement(
   db: Db,
   run: typeof heartbeatRuns.$inferSelect,
-): Promise<{ evidence: Record<string, unknown>; retire: () => Promise<boolean> } | null> {
+): Promise<{ evidence: Record<string, unknown>; retire: () => boolean } | null> {
   try {
     if (run.runtimeMode !== "native" || run.status !== "failed" || !run.finishedAt ||
         !run.nativeIssueId || !run.nativeSessionId || !run.runnerInstanceId) return null;
@@ -2584,7 +2583,7 @@ export async function verifyStoppedNativeSessionForReplacement(
     const stopped = await readNativeLocalProcessStop(db, run.companyId, run.id);
     if (!stopped) return null;
     const root = scopedRunnerdStateRoot(execution);
-    const snapshot = (await cleanupStateSnapshot(root));
+    const snapshot = cleanupStateSnapshot(root);
     const identity = record(snapshot.control.identity);
     if (!durableIdentityMatchesExecution(identity, execution) || identity.runnerInstanceId !== run.runnerInstanceId ||
         !["runnerInstanceId", "environmentLeaseId", "runId", "normalizedSessionId", "turnId", "itemId"].every(key =>
@@ -2673,8 +2672,8 @@ export async function verifyStoppedNativeSessionForReplacement(
       completedTaskControlCallIds: completedTaskControlCalls.map(call => call.callId) };
     return {
       evidence,
-      retire: async () => (await cleanupStateSnapshot(root)).fingerprint === snapshot.fingerprint &&
-        idle() && cleanupProcessAbsent(stopped.processPid) && cleanupProcessAbsent(provider.processId) &&
+      retire: () => idle() && cleanupProcessAbsent(stopped.processPid) && cleanupProcessAbsent(provider.processId) &&
+        cleanupStateSnapshot(root).fingerprint === snapshot.fingerprint &&
         nativeSha256(readBoundedNativeFile(rolloutPath, 32 * 1024 * 1024, "native_crash_inventory_unproven").toString("utf8")) === rolloutSha256 &&
         completeTerminatedLocalNativeSessionCleanup({ companyId: run.companyId, runId: run.id, runnerInstanceId: run.runnerInstanceId! }),
     };
@@ -2711,7 +2710,7 @@ export async function reconcileRetainedNativeSessionCleanup(
     quarantine: string;
     root: string;
     emptyRoot: ReturnType<typeof cleanupCanonicalVacancy>;
-    source: Awaited<ReturnType<typeof cleanupStateSnapshot>>;
+    source: ReturnType<typeof cleanupStateSnapshot>;
     providerHome: ReturnType<typeof cleanupProviderHomeSnapshot>;
     sourceArchive: {
       intent: Record<string, unknown>;
@@ -2720,7 +2719,7 @@ export async function reconcileRetainedNativeSessionCleanup(
     } | null;
     copySource: {
       directory: string;
-      snapshot: Awaited<ReturnType<typeof cleanupStateSnapshot>>;
+      snapshot: ReturnType<typeof cleanupStateSnapshot>;
       requestId: string;
     } | null;
     providerPid: number;
@@ -2951,7 +2950,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         )
           return null;
       }
-      const source = (await cleanupStateSnapshot(sourceDirectory));
+      const source = cleanupStateSnapshot(sourceDirectory);
       const identity = record(source.control.identity);
       if (
         !durableIdentityMatchesExecution(identity, execution) ||
@@ -3039,7 +3038,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         return null;
       let copySource: {
         directory: string;
-        snapshot: Awaited<ReturnType<typeof cleanupStateSnapshot>>;
+        snapshot: ReturnType<typeof cleanupStateSnapshot>;
         requestId: string;
       } | null = null;
       const providerHome = cleanupProviderHomeSnapshot(
@@ -3096,7 +3095,7 @@ export async function reconcileRetainedNativeSessionCleanup(
           })
         )
           return null;
-        const attempted = (await cleanupStateSnapshot(directory));
+        const attempted = cleanupStateSnapshot(directory);
         const receipts = await tx
           .select()
           .from(heartbeatRunEvents)
@@ -3237,7 +3236,7 @@ export async function reconcileRetainedNativeSessionCleanup(
   const authorize = async () => {
     await assertLease();
     if (
-      (await cleanupStateSnapshot(owned.quarantine)).fingerprint !==
+      cleanupStateSnapshot(owned.quarantine).fingerprint !==
         owned.source.fingerprint ||
       cleanupProviderHomeSnapshot(
         resolve(owned.quarantine, "codex-home"),
@@ -3245,7 +3244,7 @@ export async function reconcileRetainedNativeSessionCleanup(
       ).metadataFingerprint !== owned.providerHome.metadataFingerprint ||
       (owned.copySource &&
         (!retainedRunnerdMaintenanceIsIdle(owned.copySource.directory) ||
-          (await cleanupStateSnapshot(owned.copySource.directory)).fingerprint !==
+          cleanupStateSnapshot(owned.copySource.directory).fingerprint !==
             owned.copySource.snapshot.fingerprint ||
           lstatSync(
             resolve(owned.copySource.directory, CLEANUP_ACTIVATION_FILE),
@@ -3255,7 +3254,6 @@ export async function reconcileRetainedNativeSessionCleanup(
         canonicalJson(owned.emptyRoot)
     )
       throw denied();
-    await assertLease();
   };
   const appendMaintenanceHistory = async (entry: Record<string, unknown>) => {
     const history = await db.transaction(async (tx) => {
@@ -3302,7 +3300,7 @@ export async function reconcileRetainedNativeSessionCleanup(
       if (
         canonicalJson(cleanupArchiveRootIdentity(sourceDirectory)) !==
           canonicalJson(archive.intent.rootIdentity) ||
-        (await cleanupStateSnapshot(sourceDirectory)).fingerprint !==
+        cleanupStateSnapshot(sourceDirectory).fingerprint !==
           owned.source.fingerprint ||
         cleanupProviderHomeSnapshot(
           resolve(sourceDirectory, "codex-home"),
@@ -3313,7 +3311,6 @@ export async function reconcileRetainedNativeSessionCleanup(
           : existsSync(owned.root))
       )
         throw denied();
-      await assertLease();
       if (archive.fromCanonical) {
         const parent = dirname(owned.quarantine);
         mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -3328,7 +3325,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         true,
       );
       if (
-        (await cleanupStateSnapshot(owned.quarantine)).fingerprint !==
+        cleanupStateSnapshot(owned.quarantine).fingerprint !==
           owned.source.fingerprint ||
         archivedHome.fingerprint !== owned.providerHome.fingerprint ||
         canonicalJson(cleanupArchiveRootIdentity(owned.quarantine)) !==
@@ -3572,7 +3569,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         .fingerprint !== settledHome.fingerprint
     )
       throw denied();
-    await completeRetainedNativeSessionCleanup(proof);
+    completeRetainedNativeSessionCleanup(proof);
     rmSync(resolve(owned.root, CLEANUP_ACTIVATION_FILE));
     return { status: "settled", runId: input.runId };
   } catch {
@@ -3751,7 +3748,7 @@ async function assertCleanupActivationCommitted(
       entry.kind === "native_cleanup_maintenance" &&
       entry.requestId === marker.requestId,
   );
-  const snapshot = (await cleanupStateSnapshot(root));
+  const snapshot = cleanupStateSnapshot(root);
   if (
     marker.settledProviderHomeFingerprint !== undefined ||
     receipt?.settledProviderHomeFingerprint !== undefined
@@ -3791,34 +3788,10 @@ async function assertCleanupActivationCommitted(
   rmSync(path);
 }
 
-function failedNativeRetryOwnersStopped(execution: NativeExecutionInput, processPid: number | null, processGroupId: number | null): boolean {
-  const scope = nativeSessionScopeKey(execution);
-  if (
-    executingRunnerdSessionScopes.has(scope) ||
-    initializingSessionToolAuthorities.has(scope) ||
-    warmNativeSessions.has(scope)
-  )
-    return false;
-  for (const [id, group] of [
-    [processPid, false],
-    [processGroupId, true],
-  ] as const) {
-    if (id === null) continue;
-    if (!Number.isSafeInteger(id) || id <= 0) return false;
-    try {
-      process.kill(group ? -id : id, 0);
-      return false;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
-    }
-  }
-  return true;
-}
-
 /** Read-only admission evidence for an explicit retry of a terminal failed
  * run. Never migrate/archive state, release an owner, or contact a provider.
  * Normal executor admission independently verifies the state again. */
-export async function nativeFailedRunRetryStateIsSafe(input: {
+export function nativeFailedRunRetryStateIsSafe(input: {
   execution: unknown;
   companyId: string;
   issueId: string;
@@ -3832,7 +3805,7 @@ export async function nativeFailedRunRetryStateIsSafe(input: {
   processGroupId: number | null;
   recoveryMode: "bootstrap_retry" | "exact_checkpoint_resume";
   allowVerifiedBackup: boolean;
-}): Promise<boolean> {
+}): boolean {
   try {
     const execution = parseNativeExecutionInput(input.execution);
     if (
@@ -3844,7 +3817,26 @@ export async function nativeFailedRunRetryStateIsSafe(input: {
       !input.runnerInstanceId
     )
       return false;
-    if (!failedNativeRetryOwnersStopped(execution, input.processPid, input.processGroupId)) return false;
+    const scope = nativeSessionScopeKey(execution);
+    if (
+      executingRunnerdSessionScopes.has(scope) ||
+      initializingSessionToolAuthorities.has(scope) ||
+      warmNativeSessions.has(scope)
+    )
+      return false;
+    for (const [id, group] of [
+      [input.processPid, false],
+      [input.processGroupId, true],
+    ] as const) {
+      if (id === null) continue;
+      if (!Number.isSafeInteger(id) || id <= 0) return false;
+      try {
+        process.kill(group ? -id : id, 0);
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+      }
+    }
     const root = scopedRunnerdStateRoot(execution);
     if (!lstatSync(root, { throwIfNoEntry: false })) {
       if (
@@ -3883,9 +3875,7 @@ export async function nativeFailedRunRetryStateIsSafe(input: {
       }
       return true;
     }
-    const identity = (await readRunnerdDurableIdentity(root));
-    // Worker reads yield: a new in-process owner or recycled PID invalidates the earlier stop proof.
-    if (!failedNativeRetryOwnersStopped(execution, input.processPid, input.processGroupId)) return false;
+    const identity = readRunnerdDurableIdentity(root);
     if (
       !durableIdentityMatchesSession(identity, execution) ||
       !durableIdentityMatchesExecution(identity, execution) ||
@@ -3968,7 +3958,7 @@ export async function nativeFailedRunRetryStateIsSafe(input: {
 /** Physical half of retrying a request rejected before provider admission.
  * The caller separately proves the failed receipt/coordinator has no native
  * events or result and selects exactly one committed cleanup owner. */
-export async function nativePreProviderRetryAfterCleanupStateIsSafe(input: {
+export function nativePreProviderRetryAfterCleanupStateIsSafe(input: {
   failedExecution: unknown;
   retiredExecution: unknown;
   companyId: string;
@@ -3983,7 +3973,7 @@ export async function nativePreProviderRetryAfterCleanupStateIsSafe(input: {
   processPid: number;
   processGroupId: number;
   receipt: Record<string, unknown>;
-}): Promise<boolean> {
+}): boolean {
   try {
     const failed = parseNativeExecutionInput(input.failedExecution);
     const retired = parseNativeExecutionInput(input.retiredExecution);
@@ -4007,7 +3997,7 @@ export async function nativePreProviderRetryAfterCleanupStateIsSafe(input: {
       !/^[a-f0-9]{64}$/.test(input.receipt.sourceFingerprint) ||
       typeof input.receipt.settledFingerprint !== "string" ||
       !/^[a-f0-9]{64}$/.test(input.receipt.settledFingerprint) ||
-      !(await nativeFailedRunRetryStateIsSafe({
+      !nativeFailedRunRetryStateIsSafe({
         execution: retired,
         companyId: input.companyId,
         issueId: input.issueId,
@@ -4021,7 +4011,7 @@ export async function nativePreProviderRetryAfterCleanupStateIsSafe(input: {
         providerBackendSessionId: input.providerBackendSessionId,
         recoveryMode: "exact_checkpoint_resume",
         allowVerifiedBackup: false,
-      }))
+      })
     )
       return false;
     const root = scopedRunnerdStateRoot(retired);
@@ -4051,9 +4041,8 @@ export async function nativePreProviderRetryAfterCleanupStateIsSafe(input: {
         return false;
     }
     return (
-      (await cleanupStateSnapshot(root)).fingerprint ===
-      input.receipt.settledFingerprint &&
-      failedNativeRetryOwnersStopped(retired, input.processPid, input.processGroupId)
+      cleanupStateSnapshot(root).fingerprint ===
+      input.receipt.settledFingerprint
     );
   } catch {
     return false;
@@ -4130,30 +4119,46 @@ async function verifyPriorRunnerdStateForSessionScope(input: {
   }
 }
 
-async function hasRetainedWarmTransitionEvidence(root: string): Promise<boolean> {
+function hasRetainedWarmTransitionEvidence(root: string): boolean {
   for (const [directory, filename, maximum] of [
-    ["control-plane", "control-plane-state.json", DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES],
+    [
+      "control-plane",
+      "control-plane-state.json",
+      NATIVE_CONTROL_PLANE_STATE_MAX_BYTES,
+    ],
     ["runner", "runner-state.json", NATIVE_RUNNER_STATE_MAX_BYTES],
   ] as const) {
     const path = resolve(root, directory, filename);
     if (!lstatSync(path, { throwIfNoEntry: false })) continue;
+    let bytes: string;
     try {
-      const state = record(directory === "control-plane"
-        ? (await readNativeJournalProjection(path)).value
-        : JSON.parse(readBoundedNativeFile(path, maximum, "runner_state_too_large").toString("utf8")));
-      if (Object.prototype.hasOwnProperty.call(state, "warmTransition")
-        || state.schema === "paperclip.runner.durable.control-plane-state.warm-transition.v1"
-        || state.schema === "paperclip.runner.durable.state.warm-transition.v1") return true;
-    } catch (error) {
-      if (nativeJournalProofUnavailable(error)) throw error;
-      // Detection is never admission. Preserve the malformed-forward-receipt
-      // fence without materializing its potentially large discarded history.
-      try {
-        if (await nativeStateFileIncludes(path, maximum, ["warm-transition.v1", '\"warmTransition\"'])) return true;
-      } catch (error) {
-        if (nativeJournalProofUnavailable(error)) throw error;
-        // The ordinary verifier owns unreadable legacy state.
-      }
+      bytes = readBoundedNativeFile(
+        path,
+        maximum,
+        "runner_state_too_large",
+      ).toString("utf8");
+    } catch {
+      // The ordinary verifier still owns unreadable legacy state. Inspect the
+      // other file before deciding whether this is a forward-protocol fence.
+      continue;
+    }
+    try {
+      const state = record(JSON.parse(bytes));
+      if (
+        Object.prototype.hasOwnProperty.call(state, "warmTransition") ||
+        state.schema ===
+          "paperclip.runner.durable.control-plane-state.warm-transition.v1" ||
+        state.schema === "paperclip.runner.durable.state.warm-transition.v1"
+      )
+        return true;
+    } catch {
+      // This is detection only, never admission. A damaged forward receipt
+      // must remain available to its owner rather than become legacy state.
+      if (
+        bytes.includes("warm-transition.v1") ||
+        bytes.includes('"warmTransition"')
+      )
+        return true;
     }
   }
   return false;
@@ -4166,7 +4171,7 @@ type VerifiedWarmTransitionBinding = {
   stateFingerprint: string;
 };
 
-async function readWarmTransitionSnapshot(root: string) {
+function readWarmTransitionSnapshot(root: string) {
   if (
     ![root, resolve(root, "control-plane"), resolve(root, "runner")].every(
       isSafeNativeStateDirectory,
@@ -4174,23 +4179,26 @@ async function readWarmTransitionSnapshot(root: string) {
   ) {
     throw new Error("native_runner_warm_transition_recovery_unproven");
   }
-  const directoryIdentities = [root, resolve(root, "runner"), resolve(root, "control-plane")]
-    .map(path => ({ path, identity: nativeStateDirectoryIdentity(path) }));
+  const core = readBoundedNativeFile(
+    resolve(root, "control-plane", "control-plane-state.json"),
+    NATIVE_CONTROL_PLANE_STATE_MAX_BYTES,
+    "native_runner_warm_transition_recovery_unproven",
+  );
+  const runner = readBoundedNativeFile(
+    resolve(root, "runner", "runner-state.json"),
+    NATIVE_RUNNER_STATE_MAX_BYTES,
+    "native_runner_warm_transition_recovery_unproven",
+  );
   try {
-    const corePath = resolve(root, "control-plane", "control-plane-state.json");
-    const runnerPath = resolve(root, "runner", "runner-state.json");
-    const core = (await readNativeJournalProjection(corePath));
-    const runner = readBoundedNativeFile(runnerPath, NATIVE_RUNNER_STATE_MAX_BYTES, "native_runner_warm_transition_recovery_unproven");
-    // The worker preserves the original canonical JSON [base64(core), base64(runner)] hash.
-    const fingerprint = await nativeStateBase64Fingerprint([
-      { path: corePath, maximum: DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES },
-      { path: runnerPath, maximum: NATIVE_RUNNER_STATE_MAX_BYTES },
-    ]);
-    for (const directory of directoryIdentities) assertNativeStateDirectoryIdentity(directory.path, directory.identity);
-    if (fingerprint.fileSha256[0] !== core.sha256 || fingerprint.fileSha256[1] !== createHash("sha256").update(runner).digest("hex")) throw new Error("native_state_file_changed");
-    return { controlPlaneState: core.value, runnerState: JSON.parse(runner.toString("utf8")) as unknown, stateFingerprint: fingerprint.sha256 };
-  } catch (error) {
-    if (nativeJournalProofUnavailable(error)) throw error;
+    return {
+      controlPlaneState: JSON.parse(core.toString("utf8")) as unknown,
+      runnerState: JSON.parse(runner.toString("utf8")) as unknown,
+      stateFingerprint: nativeSha256([
+        core.toString("base64"),
+        runner.toString("base64"),
+      ]),
+    };
+  } catch {
     throw new Error("native_runner_warm_transition_recovery_unproven");
   }
 }
@@ -4218,11 +4226,11 @@ async function verifyWarmTransitionRestart(input: {
   )
     return deny();
   const root = scopedRunnerdStateRoot(input.execution);
-  const snapshot = (await readWarmTransitionSnapshot(root));
+  const snapshot = readWarmTransitionSnapshot(root);
   const artifact = readRunnerdArtifactBinding(resolvePaperclipRunnerBinary());
   const controller = await currentNativeControllerIdentity();
   const binding = input.execution.binding;
-  let finalAuthorityCheck: (() => Promise<boolean>) | undefined;
+  let finalAuthorityCheck: (() => boolean) | undefined;
   const verified = await input.db.transaction(async (tx) => {
     const current = await tx
       .select()
@@ -4514,9 +4522,9 @@ async function verifyWarmTransitionRestart(input: {
       root,
       input.execution,
     );
-    finalAuthorityCheck = async () => {
+    finalAuthorityCheck = () => {
       if (
-        (await readWarmTransitionSnapshot(root)).stateFingerprint !==
+        readWarmTransitionSnapshot(root).stateFingerprint !==
         snapshot.stateFingerprint
       )
         return false;
@@ -4538,7 +4546,7 @@ async function verifyWarmTransitionRestart(input: {
         finalProof.receipt.leaseExpiresAtUnixMs > Date.now()
       );
     };
-    if (!await finalAuthorityCheck()) return deny();
+    if (!finalAuthorityCheck()) return deny();
     return {
       runnerInstanceId: current.runnerInstanceId,
       environmentLeaseId: expectedEnvironmentLeaseId,
@@ -4548,7 +4556,7 @@ async function verifyWarmTransitionRestart(input: {
   });
   // A lock wait or the transaction completion itself can outlive a lease.
   // Never carry a timestamp sampled before those awaits into admission.
-  if (!await finalAuthorityCheck?.()) return deny();
+  if (!finalAuthorityCheck?.()) return deny();
   return verified;
 }
 
@@ -4585,10 +4593,7 @@ async function migrateRunnerdStateRootForExecution(input: {
     if (!isSafeNativeStateDirectory(scoped)) {
       throw new Error("runner_state_directory_unsafe");
     }
-    const scopedDirectoryIdentity = nativeStateDirectoryIdentity(scoped);
-    const retainedWarmTransition = await hasRetainedWarmTransitionEvidence(scoped);
-    assertNativeStateDirectoryIdentity(scoped, scopedDirectoryIdentity);
-    if (retainedWarmTransition) {
+    if (hasRetainedWarmTransitionEvidence(scoped)) {
       // A copied receipt is not restart/process authority. Keep both valid
       // unsupported and invalid forward evidence out of destructive legacy
       // migration until the exact transition admission path proves its owner.
@@ -4596,8 +4601,7 @@ async function migrateRunnerdStateRootForExecution(input: {
       return verified;
     }
     await assertCleanupActivationCommitted(input.db, scoped, input.execution);
-    const identity = (await readRunnerdDurableIdentity(scoped));
-    assertNativeStateDirectoryIdentity(scoped, scopedDirectoryIdentity);
+    const identity = readRunnerdDurableIdentity(scoped);
     if (!identity) {
       if (input.restartRecovery?.kind !== "reattach_existing_runner" &&
           input.restartRecovery?.kind !== "reattach_remote_runner") {
@@ -4613,9 +4617,7 @@ async function migrateRunnerdStateRootForExecution(input: {
       throw new Error("runner_state_identity_mismatch: session_scope_mismatch");
     }
     if (input.restartRecovery?.kind === "bootstrap_incomplete") {
-      const incompleteBootstrap = await runnerdStateProvesIncompleteBootstrap(scoped);
-      assertNativeStateDirectoryIdentity(scoped, scopedDirectoryIdentity);
-      if (incompleteBootstrap) {
+      if (runnerdStateProvesIncompleteBootstrap(scoped)) {
         quarantineRunnerdStateRoot(scoped, "identity_indeterminate");
         return;
       }
@@ -4654,7 +4656,6 @@ async function migrateRunnerdStateRootForExecution(input: {
         allowVerifiedBackup: input.allowVerifiedBackup,
         allowRetainedWarmRunner: input.allowRetainedWarmRunner,
       });
-      assertNativeStateDirectoryIdentity(scoped, scopedDirectoryIdentity);
       if (
         verification !== "verified" &&
         verification !== "retained_warm_runner"
@@ -4677,9 +4678,7 @@ async function migrateRunnerdStateRootForExecution(input: {
     legacyRunnerdStateRoot(input.execution),
   ]) {
     if (!existsSync(legacy)) continue;
-    const legacyDirectoryIdentity = nativeStateDirectoryIdentity(legacy);
-    const identity = (await readRunnerdDurableIdentity(legacy));
-    assertNativeStateDirectoryIdentity(legacy, legacyDirectoryIdentity);
+    const identity = readRunnerdDurableIdentity(legacy);
     if (
       !identity ||
       !durableIdentityMatchesSession(identity, input.execution)
@@ -4699,7 +4698,6 @@ async function migrateRunnerdStateRootForExecution(input: {
         allowVerifiedBackup: input.allowVerifiedBackup,
         allowRetainedWarmRunner: input.allowRetainedWarmRunner,
       });
-      assertNativeStateDirectoryIdentity(legacy, legacyDirectoryIdentity);
       if (
         verification !== "verified" &&
         verification !== "retained_warm_runner"
@@ -4715,12 +4713,12 @@ async function migrateRunnerdStateRootForExecution(input: {
       }
       verifiedPriorRunId = identity.runId;
     }
-    (await migrateLegacyRunnerdStateRoot({
+    migrateLegacyRunnerdStateRoot({
       legacy,
       scoped,
       execution: input.execution,
       ...(verifiedPriorRunId ? { verifiedPriorRunId } : {}),
-    }));
+    });
     return;
   }
 }
@@ -4766,38 +4764,38 @@ async function recoverQuiescentRunnerdState(input: {
   const verified: Array<{
     root: string;
     runnerBytes: string;
-    controlSha256: string;
+    controlBytes: string;
     providerBytes: string;
     runner: Record<string, unknown>;
     runId: string;
     processPid: number;
     processGroupId: number;
-    providerProcessIds: unknown[];
-    directoryIdentities: Array<{ path: string; identity: NativeStateDirectoryIdentity }>;
   }> = [];
   for (const root of candidates) {
     if (!isSafeNativeStateDirectory(root)) continue;
-    const identity = (await readRunnerdDurableIdentity(root));
+    const identity = readRunnerdDurableIdentity(root);
     if (!durableIdentityMatchesSession(identity, input.execution)) continue;
     if (identity.runId === input.execution.binding.runId) continue;
     try {
-      const directoryIdentities = [root, resolve(root, "runner"), resolve(root, "control-plane")]
-        .map(path => ({ path, identity: nativeStateDirectoryIdentity(path) }));
       const readState = (directory: string, name: string) => {
         if (!isSafeNativeStateDirectory(resolve(root, directory)))
           throw new Error("unsafe_recovery_state");
         return readBoundedNativeFile(
           resolve(root, directory, name),
-          nativeStateFileMaxBytes(`${directory}/${name}`),
+          directory === "control-plane" && name === "control-plane-state.json"
+            ? NATIVE_CONTROL_PLANE_STATE_MAX_BYTES
+            : NATIVE_RUNNER_STATE_MAX_BYTES,
           "recovery_state_too_large",
         ).toString("utf8");
       };
       const runnerBytes = readState("runner", "runner-state.json");
-      const controlProof = (await readNativeJournalProjection(resolve(root, "control-plane", "control-plane-state.json")));
-      const controlSha256 = controlProof.sha256;
+      const controlBytes = readState(
+        "control-plane",
+        "control-plane-state.json",
+      );
       const providerBytes = readState("runner", "codex-provider-state.json");
       const runner = record(JSON.parse(runnerBytes));
-      const control = record(controlProof.value);
+      const control = record(JSON.parse(controlBytes));
       const provider = record(JSON.parse(providerBytes));
       const commands = control.commands;
       const events = control.committedEvents;
@@ -4919,26 +4917,22 @@ async function recoverQuiescentRunnerdState(input: {
       // No mutation if any evidence changed while the database was read.
       if (
         runnerBytes !== readState("runner", "runner-state.json") ||
-        controlSha256 !== (await scanNativeStateFile(resolve(root, "control-plane", "control-plane-state.json"), DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES)).sha256 ||
+        controlBytes !==
+          readState("control-plane", "control-plane-state.json") ||
         providerBytes !== readState("runner", "codex-provider-state.json")
       )
         continue;
-      for (const directory of directoryIdentities) assertNativeStateDirectoryIdentity(directory.path, directory.identity);
-      if (processIds.some(pid => !localProcessDefinitelyGone(pid))) continue;
       verified.push({
         root,
         runnerBytes,
-        controlSha256,
+        controlBytes,
         providerBytes,
         runner,
         runId: identity.runId,
         processPid: prior.processPid!,
         processGroupId: prior.processGroupId!,
-        providerProcessIds: processIds,
-        directoryIdentities,
       });
-    } catch (error) {
-      if (nativeJournalProofUnavailable(error)) throw error;
+    } catch {
       // Unreadable, unsafe, unscoped, or unprovable state stays quarantined.
     }
   }
@@ -4959,24 +4953,24 @@ async function recoverQuiescentRunnerdState(input: {
   const candidate = verified[0]!;
   // Candidate enumeration can await other database reads. Revalidate the
   // selected evidence and dead owner immediately before the atomic moves.
-  for (const [relativePath, expected] of [
-    ["runner/runner-state.json", candidate.runnerBytes],
-    ["runner/codex-provider-state.json", candidate.providerBytes],
-    ["control-plane/control-plane-state.json", candidate.controlSha256],
-  ]) {
+  for (const [relativePath, expected, maxBytes] of [
+    ["runner/runner-state.json", candidate.runnerBytes, NATIVE_RUNNER_STATE_MAX_BYTES],
+    ["runner/codex-provider-state.json", candidate.providerBytes, NATIVE_RUNNER_STATE_MAX_BYTES],
+    ["control-plane/control-plane-state.json", candidate.controlBytes, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES],
+  ] as const) {
     if (
-      (relativePath === "control-plane/control-plane-state.json"
-        ? (await scanNativeStateFile(resolve(candidate.root, relativePath), DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES)).sha256
-        : readBoundedNativeFile(resolve(candidate.root, relativePath!), NATIVE_RUNNER_STATE_MAX_BYTES, "recovery_state_too_large").toString("utf8")) !== expected
+      readBoundedNativeFile(
+        resolve(candidate.root, relativePath),
+        maxBytes,
+        "recovery_state_too_large",
+      ).toString("utf8") !== expected
     ) {
       throw new Error("runner_state_identity_mismatch: recovery_evidence_changed");
     }
   }
-  for (const directory of candidate.directoryIdentities) assertNativeStateDirectoryIdentity(directory.path, directory.identity);
   if (
     !localProcessDefinitelyGone(candidate.processPid) ||
-    !localProcessDefinitelyGone(candidate.processGroupId, true) ||
-    candidate.providerProcessIds.some(pid => !localProcessDefinitelyGone(pid))
+    !localProcessDefinitelyGone(candidate.processGroupId, true)
   ) {
     throw new Error("runner_state_identity_mismatch: recovery_process_not_gone");
   }
@@ -5019,14 +5013,22 @@ function localProcessDefinitelyGone(value: unknown, group = false): boolean {
   }
 }
 
-export async function runnerdStateProvesIncompleteBootstrap(root: string): Promise<boolean> {
+export function runnerdStateProvesIncompleteBootstrap(root: string): boolean {
   try {
     const statePath = resolve(
       root,
       "control-plane",
       "control-plane-state.json",
     );
-    const state = record((await readNativeJournalProjection(statePath)).value);
+    const state = record(
+      JSON.parse(
+        readBoundedNativeFile(
+          statePath,
+          NATIVE_CONTROL_PLANE_STATE_MAX_BYTES,
+          "runner_durable_identity_too_large",
+        ).toString("utf8"),
+      ),
+    );
     const commands = Array.isArray(state.commands)
       ? state.commands.map(record)
       : [];
@@ -5044,27 +5046,9 @@ export async function runnerdStateProvesIncompleteBootstrap(root: string): Promi
       committedEvents.length === 0 &&
       onlyUnconsumedBootstrapCommands
     );
-  } catch (error) {
-    if (nativeJournalProofUnavailable(error)) throw error;
+  } catch {
     return false;
   }
-}
-
-function nativeJournalProofUnavailable(error: unknown): boolean {
-  return error instanceof Error && (error.message.startsWith("native_journal_worker_")
-    || error.message === "native_state_file_changed"
-    || error.message === "native_journal_projection_budget_exceeded");
-}
-
-type NativeStateDirectoryIdentity = { dev: number; ino: number };
-function nativeStateDirectoryIdentity(path: string): NativeStateDirectoryIdentity {
-  const stat = lstatSync(path);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("runner_state_directory_unsafe");
-  return { dev: stat.dev, ino: stat.ino };
-}
-function assertNativeStateDirectoryIdentity(path: string, expected: NativeStateDirectoryIdentity): void {
-  const current = nativeStateDirectoryIdentity(path);
-  if (current.dev !== expected.dev || current.ino !== expected.ino) throw new Error("runner_state_directory_unsafe");
 }
 
 function isSafeNativeStateDirectory(path: string): boolean {
@@ -5080,28 +5064,28 @@ type RunnerdDurableIdentity = Record<string, unknown> & {
   environmentLeaseId: string;
 };
 
-async function readRunnerdDurableIdentity(
+function readRunnerdDurableIdentity(
   root: string,
-): Promise<Record<string, unknown> | null> {
+): Record<string, unknown> | null {
   if (!isSafeNativeStateDirectory(root)) return null;
   const controlPlaneRoot = resolve(root, "control-plane");
   if (!isSafeNativeStateDirectory(controlPlaneRoot)) return null;
   const statePath = resolve(controlPlaneRoot, "control-plane-state.json");
   if (!existsSync(statePath)) return null;
-  const rootIdentity = nativeStateDirectoryIdentity(root);
-  const controlIdentity = nativeStateDirectoryIdentity(controlPlaneRoot);
   try {
-    const state = record((await readNativeJournalProjection(statePath, "identity")).value);
+    const state = record(
+      JSON.parse(
+        readBoundedNativeFile(
+          statePath,
+          NATIVE_CONTROL_PLANE_STATE_MAX_BYTES,
+          "runner_durable_identity_too_large",
+        ).toString("utf8"),
+      ),
+    );
     if (state.schema !== RUNNERD_CONTROL_PLANE_STATE_SCHEMA) return null;
     return record(state.identity);
-  } catch (error) {
-    // Resource pressure or a changing snapshot is not corrupt durable identity.
-    if (nativeJournalProofUnavailable(error)) throw error;
+  } catch {
     return null;
-  } finally {
-    // A replaced directory is unsafe, not merely missing identity that can be quarantined.
-    assertNativeStateDirectoryIdentity(root, rootIdentity);
-    assertNativeStateDirectoryIdentity(controlPlaneRoot, controlIdentity);
   }
 }
 
@@ -5138,7 +5122,7 @@ function durableIdentityMatchesSession(
  * session scope. Ambiguous company/session-only state can never be claimed by
  * another agent, workspace, or provider profile.
  */
-async function runnerdStateRoot(execution: NativeExecutionInput): Promise<string> {
+function runnerdStateRoot(execution: NativeExecutionInput): string {
   const scoped = scopedRunnerdStateRoot(execution);
   if (existsSync(scoped)) {
     if (!isSafeNativeStateDirectory(scoped)) {
@@ -5150,36 +5134,33 @@ async function runnerdStateRoot(execution: NativeExecutionInput): Promise<string
     legacyCompanyRunnerdStateRoot(execution),
     legacyRunnerdStateRoot(execution),
   ]) {
-    const migrated = (await migrateLegacyRunnerdStateRoot({
+    const migrated = migrateLegacyRunnerdStateRoot({
       legacy,
       scoped,
       execution,
-    }));
-    if (migrated) {
-      nativeStateDirectoryIdentity(migrated);
-      return migrated;
-    }
+    });
+    if (migrated) return migrated;
   }
   return scoped;
 }
 
-async function loadRunnerdDurableBinding(
+function loadRunnerdDurableBinding(
   execution: NativeExecutionInput,
   transition?: VerifiedWarmTransitionBinding,
-): Promise<{
+): {
   runnerInstanceId: string;
   environmentLeaseId: string;
-} | null> {
+} | null {
   if (transition) {
     if (
-      (await readWarmTransitionSnapshot((await runnerdStateRoot(execution))))
+      readWarmTransitionSnapshot(runnerdStateRoot(execution))
         .stateFingerprint !== transition.stateFingerprint
     ) {
       throw new Error("native_runner_warm_transition_recovery_unproven");
     }
     return transition;
   }
-  const identity = (await readRunnerdDurableIdentity((await runnerdStateRoot(execution))));
+  const identity = readRunnerdDurableIdentity(runnerdStateRoot(execution));
   // The run id is intentionally different during a continuation. Reuse only
   // the verified runner/lease binding from the same company-scoped durable
   // session root; rotateLocalAuthorityEpoch then requires that exact binding
@@ -7470,7 +7451,7 @@ async function executePaperclipNativeSessionWithinScope(
     });
   }
   const durableRunnerBinding = input.useRunnerd
-    ? (await loadRunnerdDurableBinding(input.execution, retainedTransition))
+    ? loadRunnerdDurableBinding(input.execution, retainedTransition)
     : null;
   const effectiveRunnerInstanceId =
     durableRunnerBinding?.runnerInstanceId ?? input.runnerInstanceId;
@@ -10607,7 +10588,7 @@ export async function createRunnerdBackend(input: {
     if (
       executingRunnerdSessionScopes.get(sessionScopeId) !==
         input.execution.binding.runId ||
-      (await hasRetainedWarmTransitionEvidence(scopedRunnerdStateRoot(input.execution)))
+      hasRetainedWarmTransitionEvidence(scopedRunnerdStateRoot(input.execution))
     ) {
       retainedTransition = await migrateRunnerdStateRootForExecution({
         db: input.db,
@@ -10732,10 +10713,10 @@ async function createRunnerdBackendWithinSessionClaim(
     authorityEpoch.revoke();
     throw error;
   }
-  const root = (await runnerdStateRoot(input.execution));
-  const durableIdentity = (await readRunnerdDurableIdentity(root));
+  const root = runnerdStateRoot(input.execution);
+  const durableIdentity = readRunnerdDurableIdentity(root);
   const durableBinding = retainedTransition
-    ? (await loadRunnerdDurableBinding(input.execution, retainedTransition))
+    ? loadRunnerdDurableBinding(input.execution, retainedTransition)
     : durableIdentityMatchesSession(durableIdentity, input.execution)
       ? durableIdentity
       : null;
@@ -11530,11 +11511,11 @@ async function createRunnerdBackendWithinSessionClaim(
 
   const claimUntouchedSessionInResumedLease = async (): Promise<boolean> => {
     if (!remoteCommandRunner || !remoteRuntimeRoot || !remoteSessionRoot) return false;
-    const identity = (await readRunnerdDurableIdentity(root));
+    const identity = readRunnerdDurableIdentity(root);
     if (!durableIdentityMatchesExecution(identity, input.execution) ||
         identity?.runnerInstanceId !== effectiveRunnerInstanceId ||
         identity?.environmentLeaseId !== effectiveEnvironmentLeaseId ||
-        !(await runnerdStateProvesIncompleteBootstrap(root))) return false;
+        !runnerdStateProvesIncompleteBootstrap(root)) return false;
     // A reusable workspace may have failed before any harness was created.
     // Claim this exact new session atomically under readable real directories.
     // Missing files inside an existing session never authorize a fresh start.
@@ -12295,11 +12276,9 @@ async function createRunnerdBackendWithinSessionClaim(
         PAPERCLIP_WORKSPACE_CWD: input.execution.workspace.cwd,
       };
   const archiveContinuityState = async () => {
-    const rootIdentity = nativeStateDirectoryIdentity(root);
-    if ((await hasRetainedWarmTransitionEvidence(root))) {
+    if (hasRetainedWarmTransitionEvidence(root)) {
       throw new Error("native_runner_warm_transition_recovery_unproven");
     }
-    assertNativeStateDirectoryIdentity(root, rootIdentity);
     const archiveToken = `${Date.now()}-${randomUUID()}`;
     const archiveRoot = resolve(root, "continuity-breaks", archiveToken);
     mkdirSync(archiveRoot, { recursive: true, mode: 0o700 });
