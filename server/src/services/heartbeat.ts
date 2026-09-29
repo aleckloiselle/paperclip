@@ -18295,6 +18295,11 @@ export function heartbeatService(
     run: typeof heartbeatRuns.$inferSelect,
     resultJson?: Record<string, unknown> | null,
   ) {
+    if (run.status === "failed") {
+      await connectionIntentService(db).requestForRunAuthFailure(run.id).catch(() => {
+        logger.warn({ runId: run.id }, "Could not attach provider authentication repair; run failure remains available");
+      });
+    }
     const classification = classifyRunLiveness(
       await buildRunLivenessInput(run, resultJson),
     );
@@ -21436,7 +21441,7 @@ export function heartbeatService(
             await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake);
             return;
           }
-          if (responsibleUserId && issueId && aiBinding.mode === "responsible_user") {
+          if (responsibleUserId && issueId) {
             await connectionIntentService(db).request({ sub: agent.id, company_id: agent.companyId, run_id: run.id, responsible_user_id: responsibleUserId }, aiBinding.provider, { purpose: "ai" }).catch(() => {
               logger.warn({ runId: run.id, agentId: agent.id }, "Could not attach AI connection request; runtime configuration action remains available");
             });

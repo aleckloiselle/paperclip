@@ -1666,6 +1666,12 @@ harness/model routing and fails closed without ambient credential fallback.
 Legacy agents retain their authentication until validated adoption. See
 [AI Connections](connections/AI-CONNECTIONS.md) for company isolation, compatible
 methods, lifecycle, runtime enforcement, and migration details.
+
+Provider login failures create a provider-specific Connections card on the task
+when the run fails, before generic recovery retries. Reconnect preserves account
+identity and permissions. Compatible legacy agents may explicitly adopt a
+validated connection inline; late failures must not invalidate newer credentials.
+
 ### Experimental task-bound email
 
 AgentMail channel connections extend the experimental conversation/task pipeline

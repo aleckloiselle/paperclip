@@ -34,6 +34,11 @@ human approval, decline, or scoped remembered permission. Connections and task
 views resolve the same review, and the agent continues with the server-recorded
 outcome. See [the implementation contract](SPEC-implementation.md#124-connection-tool-reviews).
 
+Model authentication failures also surface a provider-specific Connections card
+on the task immediately after failure. Users can reconnect inline and resume;
+legacy agents keep their authentication until an explicit, validated adoption.
+See [AI Connections](connections/AI-CONNECTIONS.md).
+
 #### Board Powers (Always Available)
 
 The Board has **unrestricted access** to the entire system at all times:

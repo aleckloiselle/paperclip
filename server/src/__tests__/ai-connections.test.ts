@@ -47,6 +47,74 @@ afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) 
 
 describe("managed AI connections", () => {
   it.each([
+    ["anthropic", false], ["openai", false], ["anthropic", true], ["openai", true],
+  ] as const)("turns a %s auth failure into one card and resumes after repair (switch method: %s)", async (provider, switchMethod) => {
+    const userId = `auth-recovery-${provider}-${switchMethod}`;
+    const id = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const adapterType = provider === "openai" ? "codex_local" : "claude_local";
+    const selectedBinding = { provider, method: "api_key", mode: "responsible_user" } as const;
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({ id, companyId, name: "Auth recovery", adapterType, runtimeConfig: { aiConnection: selectedBinding } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Fix provider login", status: "in_progress", assigneeAgentId: id });
+    const account = await service.save(companyId, userId, { provider, method: "api_key", ownership: "personal", name: "Recovery account", apiKey: "fixture", agentIds: [id], allAgents: false }, "fixture-recovery-key");
+    const runtime = await prepareManagedAiRuntime(db, { companyId, agentId: id, responsibleUserId: userId, adapterType, binding: selectedBinding, config: {} });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: id, status: "failed", errorCode: "acpx_auth_required", responsibleUserId: userId,
+      contextSnapshot: { issueId, aiConnection: { ...runtime.attribution, identity: runtime.identity } } });
+    await runtime.cleanup();
+    const intents = connectionIntentService(db);
+    const card = await intents.requestForRunAuthFailure(runId);
+    expect(card).toMatchObject({ state: "needs_user_action", service: provider });
+    expect((await intents.requestForRunAuthFailure(runId))?.interactionId).toBe(card!.interactionId);
+    const setup = await intents.setupOptions(card!.interactionId!);
+    expect(setup.existingConnections).toEqual([]);
+    expect(setup.aiRepair).toMatchObject({ canReconnect: true, connection: { id: account.connectionId, status: "needs_attention" } });
+    await expect(intents.complete(card!.interactionId!, account.connectionId, userId)).rejects.toThrow();
+    // A stopped run's token cannot call the public request path.
+    await expect(intents.request({ sub: id, company_id: companyId, run_id: runId, responsible_user_id: userId }, provider, { purpose: "ai" })).rejects.toThrow("no longer active");
+    // Reverification can keep the same credential bytes; it still supersedes the failure.
+    let repaired = account;
+    if (switchMethod) {
+      const token = provider === "openai" ? JSON.stringify({ tokens: { access_token: "fixture-subscription", refresh_token: "fixture-refresh", id_token: "fixture-id", account_id: "fixture-account" } }) : "fixture-subscription";
+      repaired = await service.save(companyId, userId, { provider, method: "subscription", ownership: "personal", name: "Recovery subscription", loginSessionId: "fixture", agentIds: [id], allAgents: false }, token);
+      await service.setDefault(companyId, userId, repaired.grantId);
+      const [original] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId));
+      expect(original.status).toBe("needs_reauthorization");
+    } else {
+      await service.save(companyId, userId, { provider, method: "api_key", ownership: "personal", name: "Recovery account", connectionId: account.connectionId, apiKey: "fixture", agentIds: [id], allAgents: false }, provider === "openai" ? "fixture-recovery-key" : "fixture-repaired-key");
+    }
+    expect((await intents.setupOptions(card!.interactionId!)).existingConnections.map(connection => connection.id)).toEqual([repaired.connectionId]);
+    await intents.complete(card!.interactionId!, repaired.connectionId, userId);
+    const wakeup = vi.fn(async (_agentId, opts) => {
+      await db.insert(agentWakeupRequests).values({ companyId, agentId: id, source: "automation", status: "queued", idempotencyKey: opts.idempotencyKey });
+      return null;
+    });
+    await connectionIntentDeliveryService(db, { wakeup } as never).deliver(card!.interactionId!);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(wakeup).toHaveBeenCalledWith(id, expect.objectContaining({ contextSnapshot: expect.objectContaining({ forceFreshSession: true }) }));
+    // Reprocessing an old failure cannot invalidate the newly saved credential.
+    await intents.requestForRunAuthFailure(runId);
+    expect((await service.select({ companyId, agentId: id, userId, adapterType, binding: selectedBinding })).grant.status).toBe("active");
+  });
+
+  it("offers a compatible connection for legacy auth failures without silently adopting it", async () => {
+    const id = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(agents).values({ id, companyId, name: "Legacy Codex", adapterType: "paperclip_runner", adapterConfig: { provider: "codex" } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Legacy auth", status: "in_progress", assigneeAgentId: id });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: id, nativeIssueId: issueId, status: "failed", errorCode: "acpx_auth_required", responsibleUserId: "alice", contextSnapshot: {} });
+    const intents = connectionIntentService(db);
+    const card = await intents.requestForRunAuthFailure(runId);
+    expect(card).toMatchObject({ service: "openai", state: "needs_user_action" });
+    expect(await intents.setupOptions(card!.interactionId!)).toMatchObject({ aiConnectionRequiresAdoption: true, aiConnection: { provider: "openai", mode: "responsible_user" } });
+    const [unchanged] = await db.select().from(agents).where(eq(agents.id, id));
+    expect(unchanged.runtimeConfig.aiConnection).toBeUndefined();
+    await db.insert(heartbeatRuns).values({ companyId, agentId: id, status: "succeeded", responsibleUserId: "alice", contextSnapshot: { issueId }, createdAt: new Date(Date.now() + 1000) });
+    expect(await intents.requestForRunAuthFailure(runId)).toBeNull();
+  });
+  it.each([
     ["anthropic", "claude_local", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
     ["openai", "codex_local", "CODEX_HOME", "OPENAI_API_KEY"],
   ] as const)("runs the same %s agent with each responsible user's subscription or API key", async (provider, adapterType, subscriptionEnv, apiEnv) => {
