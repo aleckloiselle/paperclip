@@ -154,7 +154,7 @@ For live acceptance, connect a dedicated test credential in the isolated instanc
    idle expiry and connection removal. Confirm provider shutdown and one cost entry
    per cumulative billed increment without any viewer credential in audit.
 
-The live test-drive is `http://127.0.0.1:3104/BRO/issues/BRO-1`. It uses a fresh
+The live test-drive used a fresh
 database with one company, one agent and one task; it contains no cloned inbox or
 task history. The connection was configured through the normal setup wizard and
 given a $1 per-run limit with fresh browsers. Browser Use completed a real v4 run
@@ -164,8 +164,7 @@ Browser tab, and manual address-bar navigation and Back worked inside the iframe
 Keep open renewed the idle countdown. The initial blank viewer recovered after a
 page reload; provider results alone were not treated as proof of the viewer.
 
-The earlier `3116` instance was a database clone and was unsuitable for this clean
-walkthrough. Its DOT-302 run exposed a runtime transport filter that excluded
+An earlier run exposed a runtime transport filter that excluded
 Browser Use REST tools even though the skill was installed. Both runtime tool
 delivery and the native assignment snapshot now include this reviewed REST
 connection, with a regression test covering all seven tools. Live acceptance of
@@ -280,7 +279,7 @@ Automatic fitting verification on 2026-09-29:
 - In the embedded Storybook, the page reflowed at 358 × 527 and 798 × 327 while
   retaining typed input. Phone stayed 390 × 844 when the pane changed. Two viewers
   correctly handed ownership over through the menu.
-- The fresh BRO-1 browser received a 478 × 754 Fit request and the backend verified
+- The fresh test-drive browser received a 478 × 754 Fit request and the backend verified
   those actual page dimensions. A subsequent real pane maximize/restore changed
   the remote viewport from 624 × 520 to 1040 × 520 and back through the automatic
   observer path. Its hosted viewer stayed at `about:blank` in the
@@ -334,7 +333,7 @@ Follow-up verification: 54 focused tests passed (15 service/route lifecycle test
 and 39 UI tests), plus UI/server typechecks, UI build and token gates. The original
 hosted session stayed idle and available after its original deadline; viewing
 renewed the deadline automatically. Closing/reopening the tab selected and rendered
-that same session. Proof is attached to the isolated BRO-1 test-drive.
+that same session. Proof was captured in the isolated test-drive.
 
 Second hands-on pass reproduced a stale closed tab and a viewer that required
 manual reconnect. A fresh composer request then opened paperclip.ing automatically
@@ -343,3 +342,14 @@ original stalled-navigation cause remains unproven; the bounded automatic retry
 and closed-tab recovery cover those observed failure paths. Recovery was exercised
 in the actual test-drive; 41 focused UI tests, UI typecheck/build and token gates
 passed. The automatic timeout retry is regression-tested with a non-loading iframe.
+
+## Passkey limitation
+
+The provider's current v4 authentication and live-viewer documentation does not
+document WebAuthn/passkey forwarding from the viewer's device to the cloud
+browser. Do not promise that a local Touch ID or iCloud passkey will work in the
+embedded viewer. The documented alternatives are saved login profiles, passwords
+and TOTP codes, and human entry of verification codes. Profile sync transfers
+login cookies and browser state, not a password manager; sites can reject a
+transferred login or require another verification step. See [profile sync](https://docs.browser-use.com/cloud/guides/profile-sync)
+and [1Password integration](https://docs.browser-use.com/cloud/guides/1password).
