@@ -8,6 +8,7 @@ export class BrowserUseError extends HttpError {
     status: number,
     message: string,
     public retryAfterMs = 0,
+    public requestRejected = false,
   ) {
     super(status, message);
   }
@@ -123,6 +124,7 @@ export function browserUseClient(
         429,
         "Browser Use is rate limited. Retrying after the provider's delay.",
         until - Date.now(),
+        true,
       );
     let response: Response;
     try {
@@ -166,6 +168,7 @@ export function browserUseClient(
             ? "This browser conversation is busy. Wait for its run to finish."
             : `Browser Use request failed (${response.status}).`,
         response.status === 429 ? delay : 0,
+        response.status >= 400 && response.status < 500 && response.status !== 408,
       );
     }
     const reader = response.body?.getReader();
@@ -211,6 +214,18 @@ export function browserUseClient(
       return z
         .object({ status })
         .parse(await call(`/runs/${id(runId)}/status`));
+    },
+    async listRuns(sessionId?: string | null, cursor?: string | null) {
+      const query = new URLSearchParams({ limit: "100" });
+      if (sessionId) query.set("sessionId", id(sessionId));
+      if (cursor) query.set("cursor", cursor);
+      return z.object({
+        runs: z.array(z.object({
+          id: z.string().uuid(), sessionId: z.string().uuid(), task: z.string(), status,
+        })),
+        nextCursor: z.string().nullable().optional(),
+        hasMore: z.boolean().default(false),
+      }).parse(await call(`/runs?${query}`));
     },
     async summary(runId: string) {
       return z

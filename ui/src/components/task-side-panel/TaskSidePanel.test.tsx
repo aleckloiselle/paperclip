@@ -227,6 +227,15 @@ describe("TaskSidePanel", () => {
     expect(container.textContent).toContain("Properties content");
   });
 
+  it("does not acknowledge a browser selection that could not be persisted", async () => {
+    const acknowledged = vi.fn();
+    const write = vi.spyOn(window.localStorage, "setItem").mockImplementation(() => { throw new Error("storage full"); });
+    try {
+      await render(panel({ openBrowserId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", onBrowserOpened: acknowledged }));
+      expect(acknowledged).not.toHaveBeenCalled();
+    } finally { write.mockRestore(); }
+  });
+
   it("offers the existing live browser from a closed tab and distinguishes session tabs", async () => {
     const first = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const next = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";

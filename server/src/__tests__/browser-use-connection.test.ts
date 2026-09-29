@@ -74,6 +74,7 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
       const providerSession = randomUUID(),
         providerBrowser = randomUUID();
       let providerRun = randomUUID();
+      let acceptedTask = "", loseReply = false, rejectCode = 0, recoveryPages = 0;
       let status = "running",
         stopped = false,
         browserReady = false,
@@ -91,11 +92,21 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
         const path = new URL(url).pathname.replace("/api/v4", "");
         if (path === "/profiles")
           return Response.json({ items: [], totalItems: 0 });
+        if (path === "/runs" && init.method === "GET") {
+          const cursor = Number(new URL(url).searchParams.get("cursor") ?? 0);
+          return Response.json(cursor < recoveryPages
+            ? { runs: [], hasMore: true, nextCursor: String(cursor + 1) }
+            : { runs: acceptedTask ? [{ id: providerRun, sessionId: providerSession, task: acceptedTask, status }] : [], hasMore: false });
+        }
+        if (path === "/runs" && init.method === "POST" && rejectCode)
+          return new Response("Rejected", { status: rejectCode, headers: { "Retry-After": "1" } });
         if (path === "/runs" && init.method === "POST" && failCreate)
           throw new Error("lost create response");
         if (path === "/runs" && init.method === "POST") {
           providerRun = randomUUID();
           status = "running";
+          acceptedTask = JSON.parse(String(init.body)).task;
+          if (loseReply) { browserReady = true; throw new Error("lost accepted create response"); }
           return Response.json({
             id: providerRun,
             sessionId: providerSession,
@@ -287,6 +298,9 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
         failCreate: () => {
           failCreate = true;
         },
+        loseReply: () => { loseReply = true; },
+        reject: (code: number) => { rejectCode = code; },
+        recoveryPages: (count: number) => { recoveryPages = count; },
         paginate: () => {
           paginatedEvents = true;
         },
@@ -749,12 +763,60 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
         "browser_start",
         { task: "Read" },
       );
-      expect(result).toMatchObject({ status: "failed", runStatus: "unknown" });
+      expect(result).toMatchObject({ status: "stopping", runStatus: "unknown" });
       expect(
         f.request.mock.calls.filter(
           ([url, init]) => url.endsWith("/runs") && init.method === "POST",
         ),
       ).toHaveLength(1);
+    });
+    it.each([409, 429])("keeps a browser visible and closable after a rejected continuation (%s)", async (code) => {
+      const f = await fixture();
+      const start = await f.service.execute(f.binding, f.grant, randomUUID(), "browser_start", { task: "Read" }) as { sessionId: string };
+      f.ready(); f.complete(); await f.tick();
+      f.reject(code);
+      await expect(f.service.execute(f.binding, f.grant, randomUUID(), "browser_continue", { task: "Read again", sessionId: start.sessionId })).rejects.toThrow();
+      expect(await f.service.list(f.company.id, f.issue.id, actor.actorId)).toMatchObject([{ status: "idle" }]);
+      const [session] = await db.select().from(browserUseSessions).where(eq(browserUseSessions.id, start.sessionId));
+      await f.service.control(session, "end", actor.actorId);
+      // The 429 response delays the whole credential's provider requests.
+      if (code === 429) await new Promise(resolve => setTimeout(resolve, 1050));
+      await f.tick();
+      expect(await f.service.list(f.company.id, f.issue.id, actor.actorId)).toMatchObject([{ status: "closed" }]);
+    });
+    it("recovers an accepted start after a lost response and restart, then stops and accounts without replay", async () => {
+      const f = await fixture();
+      f.loseReply(); f.recoveryPages(6);
+      await expect(f.service.execute(f.binding, f.grant, randomUUID(), "browser_start", { task: "Read" })).rejects.toThrow("could not be confirmed");
+      await f.tick();
+      const [pending] = await db.select().from(browserUseRuns).where(eq(browserUseRuns.companyId, f.company.id));
+      expect(pending.recoveryCursor).toBe("5");
+      await db.update(browserUseSessions).set({ nextPollAt: new Date(0) }).where(eq(browserUseSessions.companyId, f.company.id));
+      await browserUseService(db, f.request).sweep();
+      expect(await f.service.list(f.company.id, f.issue.id, actor.actorId)).toMatchObject([{ status: "closed" }]);
+      expect(await db.select().from(financeEvents).where(eq(financeEvents.companyId, f.company.id))).toMatchObject([{ amountCents: 15 }]);
+      expect(f.request.mock.calls.filter(([url, init]) => url.endsWith("/runs") && init.method === "POST")).toHaveLength(1);
+    });
+    it("recovers a continuation's lost reply within its existing provider session", async () => {
+      const f = await fixture();
+      const start = await f.service.execute(f.binding, f.grant, randomUUID(), "browser_start", { task: "Read" }) as { sessionId: string };
+      f.ready(); f.complete(); await f.tick();
+      f.loseReply();
+      await expect(f.service.execute(f.binding, f.grant, randomUUID(), "browser_continue", { task: "Read again", sessionId: start.sessionId })).rejects.toThrow("could not be confirmed");
+      await f.tick();
+      expect(await f.service.list(f.company.id, f.issue.id, actor.actorId)).toMatchObject([{ status: "closed" }]);
+      expect(f.request.mock.calls.some(([url]) => new URL(url).searchParams.has("sessionId"))).toBe(true);
+      expect(f.request.mock.calls.filter(([url, init]) => url.endsWith("/runs") && init.method === "POST")).toHaveLength(2);
+    });
+    it("recovers a process crash before provider identifiers were saved", async () => {
+      const f = await fixture();
+      const start = await f.service.execute(f.binding, f.grant, randomUUID(), "browser_start", { task: "Read" }) as { sessionId: string };
+      f.ready();
+      await db.update(browserUseRuns).set({ providerRunId: null, status: "creating", createdAt: new Date(Date.now() - 61_000) }).where(eq(browserUseRuns.sessionId, start.sessionId));
+      await db.update(browserUseSessions).set({ providerSessionId: null, status: "starting" }).where(eq(browserUseSessions.id, start.sessionId));
+      await f.tick();
+      expect(await f.service.list(f.company.id, f.issue.id, actor.actorId)).toMatchObject([{ status: "closed" }]);
+      expect(f.request.mock.calls.filter(([url, init]) => url.endsWith("/runs") && init.method === "POST")).toHaveLength(1);
     });
     it("drains bounded event pages after restart before closing and accounting", async () => {
       const f = await fixture();

@@ -353,3 +353,20 @@ and TOTP codes, and human entry of verification codes. Profile sync transfers
 login cookies and browser state, not a password manager; sites can reject a
 transferred login or require another verification step. See [profile sync](https://docs.browser-use.com/cloud/guides/profile-sync)
 and [1Password integration](https://docs.browser-use.com/cloud/guides/1password).
+
+## Uncertain starts and rejected continuations
+
+Each paid task includes an opaque invocation marker. The v4 API has no documented
+create idempotency key. If a response is lost or the process stops before saving
+provider identifiers, Paperclip never repeats the paid POST. The reconciler scans
+the documented run list for that exact marker, with a durable pagination cursor.
+Once found, it cancels the run, discovers and stops its browsers, and records cost.
+A missing list entry is not proof that no work exists: cleanup remains pending
+and retains the credential while recovery continues. Each sweep reads at most
+five pages. Continuations restrict recovery to their known provider session.
+
+Definite request rejections (such as HTTP 409 or 429) record a failed local run
+without closing an existing browser. That browser remains visible, retains its
+idle deadline, and can still be closed. Provider backoff also applies to cleanup.
+New-browser arrivals are queued in order and are acknowledged only after the
+panel has selected and persisted the tab. Polling cannot claim an unseen arrival.

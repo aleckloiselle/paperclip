@@ -317,10 +317,11 @@ export function TaskSidePanel({
   useEffect(() => {
     // Acknowledge only after selection and persistence commit. Clearing the
     // parent request earlier can replace the panel before its tab state lands.
-    if (openBrowserId && controller.activeTabId === `browser:${openBrowserId}`) {
+    if (openBrowserId && controller.activeTabId === `browser:${openBrowserId}` &&
+      readTaskSidePanelState(accountScope, issue.companyId, issue.id, fileTabsEnabled)?.state.activeTabId === controller.activeTabId) {
       onBrowserOpened?.();
     }
-  }, [openBrowserId, controller.activeTabId, onBrowserOpened]);
+  }, [openBrowserId, controller.activeTabId, onBrowserOpened, accountScope, issue.companyId, issue.id, fileTabsEnabled]);
   const activeTab = controller.tabs.find((tab) => tab.id === controller.activeTabId) ?? null;
   const subtasksAvailable = showSubtasksTab && (taskCount > 0 || tasksTab?.hasError === true);
   const hasSubtasksTab = controller.tabs.some((tab) => tab.id === "subtasks");

@@ -1,5 +1,5 @@
 import { TextAttachmentContext } from "../context/TextAttachmentContext";
-import { useTaskBrowsers, claimBrowserArrival } from "@/hooks/useTaskBrowsers";
+import { useTaskBrowsers, useBrowserArrivals } from "@/hooks/useTaskBrowsers";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
 import { useUserPreferences } from "../hooks/useUserPreferences";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
@@ -3620,16 +3620,13 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     if (isMobile) setMobilePropsOpen(true);
   }, [issue?.id, openTaskSidePanel, isMobile]);
   const browserQuery = useTaskBrowsers(issue?.id);
-  const [openBrowserId, setOpenBrowserId] = useState<string | null>(null);
-  const handleBrowserOpened = useCallback(() => setOpenBrowserId(null), []);
+  const { openBrowserId, openBrowser: setOpenBrowserId, acknowledgeBrowserOpened: handleBrowserOpened } =
+    useBrowserArrivals(currentUserId ?? "anonymous", issue?.id, browserQuery.data);
   useEffect(() => {
-    if (!issue?.id) return;
-    const browser = browserQuery.data?.findLast(b => b.status === "running" || b.status === "idle");
-    if (!browser || !claimBrowserArrival(currentUserId ?? "anonymous", issue.id, browser.sessionId)) return;
-    setOpenBrowserId(browser.id);
+    if (!openBrowserId) return;
     openTaskSidePanel();
     if (isMobile) setMobilePropsOpen(true);
-  }, [browserQuery.data, currentUserId, issue?.id, openTaskSidePanel, isMobile]);
+  }, [openBrowserId, openTaskSidePanel, isMobile]);
   const handleOpenSkill = useCallback((skillId: string, name: string) => {
     const next = openSkillPanelState(
       { panelBeforePlanOverrideIssueId },

@@ -64,6 +64,7 @@ const argsSchema = z
   })
   .strict();
 const terminalSessions = ["closed", "failed"];
+const requestMarker = (invocationId: string) => `\n\n[Paperclip request: ${invocationId}]`;
 
 export function browserUseService(
   db: Db,
@@ -472,7 +473,9 @@ export function browserUseService(
     let result: Awaited<ReturnType<typeof client.start>>;
     try {
       result = await client.start({
-        task: args.task,
+        // The v4 API has no create idempotency key. An opaque marker lets a
+        // read-only recovery scan identify this exact request after a lost reply.
+        task: args.task + requestMarker(invocationId),
         ...(s.providerSessionId ? { sessionId: s.providerSessionId } : {}),
         browserSettings: {
           record: false,
@@ -500,16 +503,25 @@ export function browserUseService(
       });
     } catch (error) {
       // A lost create response can mean paid work exists. Never submit it again.
-      const message =
-        "Browser run creation could not be confirmed. Check Browser Use before starting another run.";
+      const rejected = error instanceof BrowserUseError && error.requestRejected;
+      const message = rejected ? error.message :
+        "Browser run creation could not be confirmed. Paperclip is locating and stopping possible provider work. Do not start another run yet.";
       await db
         .update(runs)
-        .set({ status: "unknown" })
+        .set({ status: rejected ? "failed" : "unknown", eventsDrained: rejected ? 1 : 0 })
         .where(eq(runs.invocationId, invocationId));
-      await db
-        .update(sessions)
-        .set({ status: "failed", error: message })
-        .where(eq(sessions.id, s.id));
+      await db.transaction(async tx => {
+        const [current] = await tx.select().from(sessions).where(eq(sessions.id, s.id)).for("update");
+        const stopping = !rejected || current.stopRequested === "end";
+        await tx.update(sessions).set({
+          status: stopping ? "stopping" : (s.providerSessionId ? "idle" : "failed"),
+          stopRequested: stopping ? "end" : null,
+          idleDeadline: rejected && s.providerSessionId ? new Date(Date.now() + BROWSER_USE_IDLE_MS) : null,
+          error: message,
+          nextPollAt: new Date(),
+          updatedAt: new Date(),
+        }).where(eq(sessions.id, s.id));
+      });
       throw new BrowserUseError(
         error instanceof BrowserUseError ? error.status : 502,
         message,
@@ -664,7 +676,7 @@ export function browserUseService(
         status:
           b?.status === "stopped"
             ? "closed"
-            : !b && !terminalSessions.includes(s.status)
+            : !b && !terminalSessions.includes(s.status) && s.status !== "stopping"
               ? "starting"
               : (s.status as TaskBrowser["status"]),
         runStatus: run?.status ?? null,
@@ -1040,25 +1052,46 @@ export function browserUseService(
     let discovered = false;
     for (const run of allRuns) {
       if (!run.providerRunId) {
-        active ||= run.status === "creating";
-        if (
-          Date.now() - run.createdAt.getTime() > 60_000 &&
-          run.status === "creating"
-        ) {
-          await db
-            .update(runs)
-            .set({ status: "unknown" })
-            .where(eq(runs.id, run.id));
-          await db
-            .update(sessions)
-            .set({
-              status: "failed",
-              error:
-                "Run creation was interrupted. Check Browser Use before starting again.",
-            })
-            .where(eq(sessions.id, s.id));
+        if (run.eventsDrained) continue; // A definitive rejection made no paid run.
+        if (run.status === "creating" && Date.now() - run.createdAt.getTime() <= 60_000) {
+          active = true;
+          continue;
         }
-        continue;
+        end = true;
+        await db.update(sessions).set({ status: "stopping", stopRequested: "end" })
+          .where(eq(sessions.id, s.id));
+        let cursor = run.recoveryCursor;
+        for (let page = 0; page < 5 && !run.providerRunId; page++) {
+          const listed = await client.listRuns(s.providerSessionId, cursor);
+          const matches = listed.runs.filter(candidate =>
+            candidate.task.endsWith(requestMarker(run.invocationId)) &&
+            (!s.providerSessionId || candidate.sessionId === s.providerSessionId));
+          if (matches.length > 1) throw new BrowserUseError(502, "Browser recovery found ambiguous provider work.");
+          const found = matches[0];
+          if (found) {
+            await db.transaction(async tx => {
+              await tx.update(runs).set({ providerRunId: found.id, status: found.status, recoveryCursor: null })
+                .where(eq(runs.id, run.id));
+              await tx.update(sessions).set({ providerSessionId: found.sessionId })
+                .where(eq(sessions.id, s.id));
+            });
+            run.providerRunId = found.id;
+            run.status = found.status;
+            s.providerSessionId = found.sessionId;
+            break;
+          }
+          if (listed.hasMore && (!listed.nextCursor || listed.nextCursor === cursor))
+            throw new BrowserUseError(502, "Browser recovery cursor did not advance.");
+          cursor = listed.hasMore ? listed.nextCursor! : null;
+          await db.update(runs).set({ status: "unknown", recoveryCursor: cursor }).where(eq(runs.id, run.id));
+          if (!listed.hasMore) break;
+        }
+        if (!run.providerRunId) {
+          // Absence from a list cannot prove a timed-out POST was rejected.
+          // Keep cleanup pending and retain its credential for later discovery.
+          active = true;
+          continue;
+        }
       }
       const [parent] = await db
         .select({ status: heartbeatRuns.status })
@@ -1181,7 +1214,7 @@ export function browserUseService(
     } else if (
       !active &&
       allRuns.length &&
-      allRuns.every((r) => r.providerRunId)
+      allRuns.every((r) => r.providerRunId || r.eventsDrained)
     ) {
       await db
         .update(sessions)

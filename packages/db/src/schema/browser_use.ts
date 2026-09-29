@@ -83,6 +83,7 @@ export const browserUseRuns = pgTable(
       .references(() => heartbeatRuns.id),
     invocationId: uuid("invocation_id").notNull(),
     providerRunId: uuid("provider_run_id"),
+    recoveryCursor: text("recovery_cursor"),
     status: text("status").notNull().default("creating"),
     detachedUntil: timestamp("detached_until", { withTimezone: true }),
     eventCursor: integer("event_cursor").notNull().default(0),
