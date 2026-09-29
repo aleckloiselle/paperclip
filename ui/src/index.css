@@ -3155,3 +3155,10 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
 @media (max-width: 767px) {
   .plugin-app-shell-overlays { bottom: var(--plugin-shell-mobile-bottom); }
 }
+
+:root {
+  /* Browser Use live viewer chrome: 30px tab strip + 40px navigation bar.
+     Provider integration measurement (2026-09-29), not Paperclip spacing.
+     Keep navigation visible; the cross-origin viewer exposes no sizing message. */
+  --browser-use-viewer-chrome-height: 70px;
+}

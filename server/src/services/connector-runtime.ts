@@ -55,6 +55,13 @@ interface ConnectorDefinition {
 // Trusted connector packages declare their contributions here. Assignments and
 // current access, not credential availability or agent-authored config, select them.
 const connectors: ConnectorDefinition[] = [
+  { key: "browser-use", label: "Browser Use", skillName: "browser-use", tools: [],
+    async resolve(db, binding) {
+      const { getAssignedMcpGateway } = await import("./native-runtime/assigned-mcp-tools.js");
+      try { return await getAssignedMcpGateway(db).browserUseResources(binding); } catch { return []; }
+    },
+    async execute() { throw forbidden("Use Browser Use through the connection tool gateway."); },
+  },
   { key: "slack", label: "Slack", skillName: "slack",
     tools: SLACK_TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
     resolve: slackAssignedResource,

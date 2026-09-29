@@ -12,6 +12,7 @@ import type {
   IssueDocument,
   IssueQueuedCommentQueue,
   IssueThreadInteraction,
+  TaskBrowser,
 } from "@paperclipai/shared";
 import { heartbeatsApi } from "@/api/heartbeats";
 import { nativeRunEventsToTranscript } from "./transcript/native-run-events";
@@ -148,6 +149,43 @@ function render(ui: ReactElement) {
     ),
   );
 }
+
+it.each([true, false])("interleaves browser sessions with their requests and preserves position on status updates (streamlined=%s)", (streamlined) => {
+  streamlinedState.enabled = streamlined;
+  const onOpenBrowser = vi.fn();
+  const comments = [0, 2, 4].map((minute) => ({
+    id: `comment-${minute}`, companyId: "company", issueId: "issue",
+    authorType: "user" as const, authorAgentId: null, authorUserId: "board",
+    body: `Request at minute ${minute}`, presentation: null, metadata: null,
+    createdAt: new Date(`2026-09-29T12:0${minute}:00Z`), updatedAt: new Date(`2026-09-29T12:0${minute}:00Z`),
+  }));
+  const browsers: TaskBrowser[] = [1, 3].map((minute) => ({
+    id: `browser-${minute}`, sessionId: `session-${minute}`, issueId: "issue",
+    status: "idle" as const, runStatus: "completed" as const, progress: null,
+    costCents: 0, error: null, idleDeadline: null, expiresAt: null,
+    createdAt: `2026-09-29T12:0${minute}:00Z`,
+  }));
+  const show = (next = browsers) => render(<TaskChatThread comments={comments} browsers={next} onOpenBrowser={onOpenBrowser} threadHeader={<div>Task title</div>} onAdd={async () => {}} />);
+  show();
+  const anchors = () => Array.from(container.querySelectorAll('[data-thread-anchor]')).map(el => el.getAttribute('data-thread-anchor'));
+  const expected = ['comment-0', 'browser:session-1', 'comment-2', 'browser:session-3', 'comment-4'];
+  expect(anchors()).toEqual(expected);
+  expect(container.querySelector('[data-testid="task-chat-thread-header"]')?.textContent).toBe("Task title");
+  const row = container.querySelector('[data-thread-anchor="browser:session-1"]');
+  act(() => row?.querySelector<HTMLButtonElement>('button')?.click());
+  expect(onOpenBrowser).toHaveBeenCalledWith('browser-1');
+  // Provider IDs can become available after startup; session identity stays put.
+  show([{ ...browsers[0], id: 'provider-browser-1', status: 'closed' }, browsers[1]]);
+  expect(anchors()).toEqual(expected);
+  expect(container.querySelector('[data-thread-anchor="browser:session-1"]')).toBe(row);
+  expect(row?.textContent).toContain("View session");
+  act(() => row?.querySelector<HTMLButtonElement>('button')?.click());
+  expect(onOpenBrowser).toHaveBeenLastCalledWith('provider-browser-1');
+  render(<TaskChatThread comments={comments.slice(1)} browsers={browsers} hasOlderComments onAdd={async () => {}} />);
+  expect(anchors()).toEqual(['comment-2', 'browser:session-3', 'comment-4']);
+  show();
+  expect(anchors()).toEqual(expected);
+});
 
 it("coordinates first reveal while keeping the composer and visible history mounted through refresh", async () => {
   const props = {

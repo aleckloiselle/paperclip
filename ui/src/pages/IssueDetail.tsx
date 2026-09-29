@@ -1,4 +1,5 @@
 import { TextAttachmentContext } from "../context/TextAttachmentContext";
+import { useTaskBrowsers, claimBrowserArrival } from "@/hooks/useTaskBrowsers";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
 import { useUserPreferences } from "../hooks/useUserPreferences";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
@@ -1181,6 +1182,8 @@ function InboxMobileToolbar({
 }
 
 type IssueDetailChatTabProps = {
+  browsers?: import("@paperclipai/shared").TaskBrowser[];
+  onOpenBrowser?: (browserId: string) => void;
   onOpenSkill?: (skillId: string, name: string) => void;
   issueId: string;
   companyId: string;
@@ -1332,6 +1335,8 @@ type IssueDetailChatTabProps = {
 };
 
 const IssueDetailChatTab = memo(function IssueDetailChatTab({
+  browsers,
+  onOpenBrowser,
   onOpenSkill,
   issueId,
   companyId,
@@ -2323,6 +2328,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             key={conversationMode ? draftKey : issueId}
             {...(!classicTaskInterfaceEnabled ? { creationActivity: resolvedActivity } : {})}
             onOpenSkill={onOpenSkill}
+            browsers={browsers}
+            onOpenBrowser={onOpenBrowser}
+            hasOlderComments={hasOlderComments}
             initialHistoryPending={!!issueId && (
               initialHistoryPending ||
               commentsInitialLoading ||
@@ -3611,6 +3619,17 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     openTaskSidePanel();
     if (isMobile) setMobilePropsOpen(true);
   }, [issue?.id, openTaskSidePanel, isMobile]);
+  const browserQuery = useTaskBrowsers(issue?.id);
+  const [openBrowserId, setOpenBrowserId] = useState<string | null>(null);
+  const handleBrowserOpened = useCallback(() => setOpenBrowserId(null), []);
+  useEffect(() => {
+    if (!issue?.id) return;
+    const browser = browserQuery.data?.findLast(b => b.status === "running" || b.status === "idle");
+    if (!browser || !claimBrowserArrival(currentUserId ?? "anonymous", issue.id, browser.sessionId)) return;
+    setOpenBrowserId(browser.id);
+    openTaskSidePanel();
+    if (isMobile) setMobilePropsOpen(true);
+  }, [browserQuery.data, currentUserId, issue?.id, openTaskSidePanel, isMobile]);
   const handleOpenSkill = useCallback((skillId: string, name: string) => {
     const next = openSkillPanelState(
       { panelBeforePlanOverrideIssueId },
@@ -5691,6 +5710,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       openPanel(
         <IssueGalleryContext.Provider value={openIssueGallery}>
           <TaskSidePanel
+            openBrowserId={openBrowserId}
+            onBrowserOpened={handleBrowserOpened}
             key={panelIssue.id}
             {...sharedProps}
             accountScope={currentUserId ?? "anonymous"}
@@ -5714,6 +5735,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     }
     return () => closePanel();
   }, [
+    openBrowserId,
+    handleBrowserOpened,
     closePanel,
     openIssueGallery,
     handleIssuePropertiesUpdate,
@@ -7779,6 +7802,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                 }}>
                 <IssueDetailChatTab
                   onOpenSkill={handleOpenSkill}
+                  browsers={browserQuery.data}
+                  onOpenBrowser={(id) => { setOpenBrowserId(id); if (isMobile) setMobilePropsOpen(true); else openTaskSidePanel(); }}
                   threadHeader={<>{taskChatThreadHeader}{instanceExperimentalSettings?.enableChatConnectors && <EmailTaskActivity key={issue.id} companyId={issue.companyId} issueId={issue.id} />}</>}
                   issueBrief={
                     // Suppress the seeded-description bubble for the onboarding first
@@ -8171,6 +8196,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     <SheetTitle>Task side panel</SheetTitle>
                   </SheetHeader>
                   <TaskSidePanel
+                    openBrowserId={openBrowserId}
+                    onBrowserOpened={handleBrowserOpened}
                     key={`${issue.id}:mobile`}
                     issue={issue}
                     accountScope={currentUserId ?? "anonymous"}

@@ -217,7 +217,7 @@ CREATE TABLE "chat_sdk_state" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-ALTER TABLE "tool_connections" DROP CONSTRAINT "tool_connections_transport_check";--> statement-breakpoint
+ALTER TABLE "tool_connections" DROP CONSTRAINT IF EXISTS "tool_connections_transport_check";--> statement-breakpoint
 ALTER TABLE "tool_connections" ADD COLUMN "connection_purpose" text DEFAULT 'tool' NOT NULL;--> statement-breakpoint
 ALTER TABLE "chat_actions" ADD CONSTRAINT "chat_actions_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "chat_actions" ADD CONSTRAINT "chat_actions_delivery_id_chat_deliveries_id_fk" FOREIGN KEY ("delivery_id") REFERENCES "public"."chat_deliveries"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint

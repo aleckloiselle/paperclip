@@ -2191,6 +2191,16 @@ Collect end-to-end evidence using the production validation matrix above:
 - Audit rows prove actor, run/issue context, connection, tool, decision,
   reason code, and outcome.
 
+## Reviewed REST browser connection
+
+[Browser Use Cloud](./BROWSER-USE.md) uses the v4 REST API through the same
+connection grants, catalog, policies, approvals and audit gateway. Its
+`provider_rest` execution path is limited to the reviewed Browser Use adapter;
+adding `rest_api` to a catalog entry does not enable arbitrary HTTP execution.
+The task Browser panel is a human-only credential viewer, separate from agent
+tool results. Follow that guide for lifecycle, profile scope, cost accounting,
+cleanup and the required live acceptance pass.
+
 ## Slack task tools
 
 For Slack bot tool contributions, use [Slack task tools](SLACK-TASK-TOOLS.md). It

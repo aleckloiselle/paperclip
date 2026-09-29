@@ -17,6 +17,7 @@ import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
 import { githubBotConnectionIdsForRun } from "./chat-github-tools.js";
+import { isBrowserUseConnection } from "./browser-use-client.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
@@ -4612,6 +4613,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
             id: toolConnections.id,
             name: toolConnections.name,
             transport: toolConnections.transport,
+            config: toolConnections.config,
           })
           .from(toolConnections)
           .where(
@@ -4625,7 +4627,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     .filter(
       (connection) =>
         (connection.transport === "mcp_remote" ||
-          connection.transport === "local_stdio") &&
+          connection.transport === "local_stdio" || isBrowserUseConnection(connection)) &&
         !allInstalledConnectionIds.has(connection.id),
     )
     .map(({ id, name }) => ({ id, name }))
@@ -4642,7 +4644,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
         connection.credentialPolicy === "per_user" ||
         !isToolConnectionAttentionHealth(connection.healthStatus)) &&
       (connection.transport === "mcp_remote" ||
-        connection.transport === "local_stdio" || githubBotConnectionIds.has(connection.id)),
+        connection.transport === "local_stdio" || isBrowserUseConnection(connection) || githubBotConnectionIds.has(connection.id)),
   );
   const assignedConnectionIds = new Set(
     assignedConnections.map((connection) => connection.id),
