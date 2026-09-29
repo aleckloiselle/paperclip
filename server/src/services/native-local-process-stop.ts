@@ -79,7 +79,7 @@ export async function hasHistoricalSuspendedNativeSession(db: Db, run: typeof he
   if (checkpoint?.providerSessionId != null && (typeof checkpoint.providerSessionId !== "string" ||
       !checkpoint.providerSessionId.trim())) return false;
   const { nativeFailedRunRetryStateIsSafe } = await import("./native-runtime/native-session-executor.js");
-  return nativeFailedRunRetryStateIsSafe({
+  return (await nativeFailedRunRetryStateIsSafe({
     execution: run.runnerProfileJson?.nativeExecutionInput,
     companyId: run.companyId, issueId: run.nativeIssueId, agentId: run.agentId, runId: run.id,
     nativeSessionId: run.nativeSessionId, runnerInstanceId: run.runnerInstanceId,
@@ -87,7 +87,7 @@ export async function hasHistoricalSuspendedNativeSession(db: Db, run: typeof he
     providerSessionId: typeof checkpoint?.sessionId === "string" ? checkpoint.sessionId : null,
     providerBackendSessionId: typeof checkpoint?.providerSessionId === "string" ? checkpoint.providerSessionId : null,
     recoveryMode: "exact_checkpoint_resume", allowVerifiedBackup: false,
-  });
+  }));
 }
 
 /** Recover the exact stopped identity after the mutable run fields were cleared. */

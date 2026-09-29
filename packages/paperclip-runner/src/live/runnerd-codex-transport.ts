@@ -48,6 +48,7 @@ import type {
 } from "../contracts/harness-driver.js";
 import {
   DurablePrpControlPlane,
+  DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES,
   durableRecoveryInternals,
   inspectWarmRunTransition,
   spawnRunner,
@@ -156,7 +157,7 @@ function readControlPlaneState(directory: string): Record<string, unknown> {
   if (
     metadata.isSymbolicLink() ||
     !metadata.isFile() ||
-    metadata.size > 64 * 1024 * 1024
+    metadata.size > DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES
   ) {
     throw new Error("native_runner_control_plane_state_unsafe");
   }
@@ -1996,7 +1997,15 @@ function readMaintenanceState(root: string) {
   const bytes = MAINTENANCE_STATE_FILES.map((file) => {
     const path = resolve(root, file);
     const stat = lstatSync(path);
-    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 32 * 1024 * 1024)
+    const maxBytes =
+      file === "control-plane/control-plane-state.json"
+        ? DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES
+        : 32 * 1024 * 1024;
+    if (
+      stat.isSymbolicLink() ||
+      !stat.isFile() ||
+      stat.size > maxBytes
+    )
       throw maintenanceDenied();
     return readFileSync(path);
   });

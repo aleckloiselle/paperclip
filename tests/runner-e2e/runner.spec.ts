@@ -2,6 +2,7 @@ import { completionQualityControls, completionQualityStatus, judgeCompletionQual
 import { completionDelivery, type CompletionObservation } from "./completion-updates.js";
 import { runInstructionPersistenceFlow } from "./instruction-persistence.js";
 import { gradeApiResponsePaging, readResponseProof, responseEvidenceDescription } from "./api-response-reading.js";
+import { largeJournalEvidence } from "./journal-evidence.js";
 import { observeBrowserBootstrap } from "./browser-bootstrap-diagnostics.js";
 import { runAccountingFlow } from "./accounting-flow.js";
 import type { Issue } from "../../packages/shared/src/types/issue.js";
@@ -1613,7 +1614,19 @@ for (const execution of executions) {
               `Warm turn ${completedTurn} replaced its Daytona sandbox`,
             );
           }
+          const journalEvidence = execution.suite.id === "daytona-journal-continuity" && completedTurn === 1
+            ? await largeJournalEvidence({
+                stateRoot: path.join(process.env.PAPERCLIP_HOME!, "instances", process.env.PAPERCLIP_INSTANCE_ID!, "runtime", "paperclip-runner", "durable-sessions"),
+                runId: chronologicalRuns.at(-1)!.id,
+                minimumBytes: 2 * 1024 * 1024,
+                minimumCompletedStimulusCalls: 240,
+              })
+            : undefined;
+          if (journalEvidence) {
+            await writeSanitizedJson(snapshotsDir, "large-journal-boundary.json", journalEvidence, secrets);
+          }
           turnEvidence.push({
+            ...(journalEvidence ? { journalEvidence } : {}),
             turn: completedTurn,
             issue: waitingState.currentIssue,
             run: chronologicalRuns.at(-1),

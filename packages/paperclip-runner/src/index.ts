@@ -27,6 +27,7 @@ export {
 export * from "./native-session-runtime.js";
 export {
   DurablePrpControlPlane,
+  DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES,
   inspectWarmRunTransition,
   type DurablePrpControlPlaneOptions,
   type PrpWireConnection,

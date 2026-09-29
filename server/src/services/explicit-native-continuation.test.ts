@@ -379,7 +379,7 @@ const support = await getEmbeddedPostgresTestSupport();
     "requires exact local cleanup for a new turn after worker loss (%s)", async mode => {
       const f = await seed();
       await db.update(heartbeatRuns).set({ errorCode: "native_session_cleanup_quarantined" }).where(eq(heartbeatRuns.id, f.sourceRunId));
-      const retire = vi.fn(() => mode !== "changed");
+      const retire = vi.fn(async () => mode !== "changed");
       const verify = vi.spyOn(nativeExecutor, "verifyStoppedNativeSessionForContinuation").mockResolvedValue(
         mode === "unproven" ? null : { evidence: { runId: f.sourceRunId, schema: "paperclip.stopped_native_conversation.v1" }, retire });
       try {

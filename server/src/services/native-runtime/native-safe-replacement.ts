@@ -41,7 +41,7 @@ export async function reconcileSafeNativeReplacements(
   options: {
     verifyStoppedSession?: (run: typeof heartbeatRuns.$inferSelect) => Promise<{
       evidence: Record<string, unknown>;
-      retire: () => boolean;
+      retire: () => boolean | Promise<boolean>;
     } | null>;
     /** Test fault injection at durability boundaries; never exposed by an API. */
     failpoint?: (phase: "successor_inserted" | "lineage_committed") => void;
@@ -358,7 +358,7 @@ export async function reconcileSafeNativeReplacements(
         }
         if (stoppedSession) {
           // If the last ownership proof changes, roll back the status restoration.
-          if (!stoppedSession.retire()) throw new Error("native_replacement_stopped_session_changed");
+          if (!await stoppedSession.retire()) throw new Error("native_replacement_stopped_session_changed");
           await appendHeartbeatRunEvent(tx as unknown as Db, {
             companyId: run.companyId, runId: run.id, agentId: run.agentId,
             eventType: "native.stopped_text_turn_verified", stream: "system", level: "info",

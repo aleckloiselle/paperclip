@@ -216,6 +216,38 @@ Catalog generation and production authorization are separate steps.
   effect.
 - Receipts redact credentials, private provider payloads, and hidden identity.
 
+## Durable journal proof reads
+
+The durable writer and controller accept the same 192 MiB raw journal limit.
+Identity, cleanup, warm-transition, and quiescent recovery reads scan the JSON
+off the API event loop with a fixed 48 KiB input buffer. A single worker admits
+at most 32 queued proofs. Proofs waiting over 30 seconds are rejected as busy;
+each admitted proof gets a full, separate 30-second execution budget.
+An expired or failed worker is terminated and joined before another job starts.
+Its V8 heap is capped independently of the controller. Idle workers are unrefed
+and stopped after 15 seconds. They retain only the fields used to prove
+ownership, completion, and settled side effects. Generic tool output and task
+text do not become a second in-memory journal. The proof's retained JSON
+representation is capped at 8 MiB; discarded values, temporary property keys,
+and superseded duplicate keys do not consume that budget. Worker heap limits
+separately bound the cost of objects and token decoding.
+
+Proof reads validate discarded JSON as well as retained fields. They preserve
+original types, duplicate-key last-wins behavior, semantic completion evidence,
+negative replay evidence, provider process owners, and complete `run.attach`
+commands and results. The full raw file digest covers all omitted bytes.
+Warm-transition fingerprints keep their existing byte-exact
+algorithm. Nonblocking opens reject special files before a worker can hang in
+an operating-system read. Symlinks, changing files, invalid JSON, excessive
+nesting, or excess essential evidence fail closed. A projection is read-only evidence and must
+never be written back as a replacement journal.
+
+The transport's retained-session and cleanup readers use that same 192 MiB
+controller-journal ceiling; their runner/provider file limits stay unchanged.
+Those transport reads still load complete state. Proof scans also take time
+proportional to journal bytes. This fixes inconsistent reader limits, not
+unbounded history capacity or history-independent continuation latency.
+
 ## Required compatibility matrix
 
 Each runner-related pull request updates only rows that it can execute. The

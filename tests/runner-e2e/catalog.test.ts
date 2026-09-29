@@ -15,6 +15,7 @@ import {
   runnerSuites,
   runnerTasks,
   daytonaWarmContinuityTask,
+  daytonaLargeJournalTask,
   daytonaWarmEnvironment,
   isImmutableDaytonaImage,
   pendingContextIntegrityProfiles,
@@ -91,10 +92,10 @@ describe("runner E2E catalog", () => {
     expect(localIntegrityTasks).toHaveLength(2);
     expect(openRouterBreadthTasks).toHaveLength(3);
     expect(runnerSuites.map((suite) => suite.expectedMatrixSize)).toEqual([
-      30, 3, 16, 16, 2, 8, 46, 23, 47, 20, 52, 28, 18, 6, 6, 10, 48, 16, 10, 2,
+      30, 3, 16, 16, 2, 8, 46, 23, 47, 20, 52, 28, 18, 6, 6, 10, 48, 16, 10, 2, 1,
     ]);
-    expect(validateRunnerCatalog()).toHaveLength(407);
-    expect(new Set(runnerMatrix.map((entry) => entry.id)).size).toBe(407);
+    expect(validateRunnerCatalog()).toHaveLength(408);
+    expect(new Set(runnerMatrix.map((entry) => entry.id)).size).toBe(408);
     expect(
       runnerMatrix.filter((entry) => entry.suite.id === "core-compatibility"),
     ).toHaveLength(48);
@@ -204,6 +205,18 @@ describe("runner E2E catalog", () => {
         ],
       }),
     ).not.toBe(suiteDefinitionHash(suite));
+  });
+
+  it("keeps large-journal stress explicit-only and uses the ordinary warm workflow", () => {
+    const suite = runnerSuites.find((candidate) => candidate.id === "daytona-journal-continuity")!;
+    expect(suite.manualOnly).toBe(true);
+    expect(suite.expectedMatrixSize).toBe(1);
+    expect(suite.profiles.map((profile) => profile.id)).toEqual(["runner-codex"]);
+    expect(daytonaLargeJournalTask.flow).toBe("warm_three_turn");
+    expect(daytonaLargeJournalTask.buildPrompt("nonce")).toContain("240 separate execution-tool calls");
+    expect(daytonaLargeJournalTask.buildFollowupMessages!("nonce")).toEqual(daytonaWarmContinuityTask.buildFollowupMessages!("nonce"));
+    expect(selectRunnerExecutions(parseRunnerSelectors(["--all"]))
+      .some((cell) => cell.suite.id === suite.id)).toBe(false);
   });
 
   it("derives the qualified local native OpenCode profiles from the ranked snapshot", () => {

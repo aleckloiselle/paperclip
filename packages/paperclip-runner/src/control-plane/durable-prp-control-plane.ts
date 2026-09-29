@@ -58,7 +58,9 @@ const maxCommands = 500;
 // polling turn regains the event loop. Match the transport's explicit deferred
 // event bound so a valid burst is not compacted before it can be observed.
 const maxCommittedEventWindow = 4_096;
-const maxStateBytes = 192 * 1024 * 1024;
+// The controller admission, cleanup, and recovery readers inspect this same
+// journal. Keep their bound aligned with the durable store as history grows.
+export const DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES = 192 * 1024 * 1024;
 const authChallengeTtlMs = 5_000;
 const stableIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/;
 const runnerDigestPattern = /^sha256:[0-9a-f]{64}$/;
@@ -1114,7 +1116,7 @@ function readPrivateFile(path: string): string | null {
   try {
     const metadata = fstatSync(descriptor);
     verifyPrivateRegularFile(metadata, path);
-    if (metadata.size > maxStateBytes) {
+    if (metadata.size > DURABLE_PRP_CONTROL_PLANE_MAX_STATE_BYTES) {
       throw new Error(`Private state file exceeds its size bound: ${path}`);
     }
     return readFileSync(descriptor, "utf8");

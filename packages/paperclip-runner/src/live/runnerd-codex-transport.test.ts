@@ -1,4 +1,5 @@
 import {
+  appendFile,
   chmod,
   cp,
   mkdir,
@@ -970,9 +971,13 @@ it("requires ACPX command results to preserve the requested turn identity", () =
   ).toBe(true);
 });
 
-it.each(["before", "after"] as const)(
-  "retries external authority rotation after crashing %s the remote archive",
-  async (crashPoint) => {
+it.each([
+  { crashPoint: "before", historyMiB: 0 },
+  { crashPoint: "before", historyMiB: 65 },
+  { crashPoint: "after", historyMiB: 0 },
+])(
+  "retries external authority rotation after crashing $crashPoint the remote archive with $historyMiB MiB journal history",
+  async ({ crashPoint, historyMiB }) => {
     const root = await mkdtemp(join(tmpdir(), "runner-external-rotation-"));
     const priorIdentity = {
       runnerInstanceId: "runner-external-rotation",
@@ -1041,6 +1046,25 @@ it.each(["before", "after"] as const)(
       await expect(stat(join(root, "control-plane"))).rejects.toMatchObject({
         code: "ENOENT",
       });
+
+      if (historyMiB > 0) {
+        const archives = await readdir(join(root, "authority-epochs"));
+        expect(archives).toHaveLength(1);
+        const archivedState = join(
+          root,
+          "authority-epochs",
+          archives[0]!,
+          "control-plane",
+          "control-plane-state.json",
+        );
+        const padding = Buffer.alloc(1024 * 1024, 0x20);
+        for (let index = 0; index < historyMiB; index += 1) {
+          await appendFile(archivedState, padding);
+        }
+        expect((await stat(archivedState)).size).toBeGreaterThan(
+          64 * 1024 * 1024,
+        );
+      }
 
       await expect(
         runnerdRecoveryInternals.rotateExternalAuthorityEpoch(
