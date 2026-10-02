@@ -77,6 +77,8 @@ type WakeReceipt = { id: string; companyId: string; idempotencyKey: string; stat
 const LIVE_WAKE_STATUSES = ["queued", "claimed", "coalesced", "deferred_issue_execution", "running"];
 const DELIVERED_WAKE_STATUSES = [...LIVE_WAKE_STATUSES, "completed", "failed"];
 const SETTLED_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out", "interrupted", "skipped"];
+/** Linked run rows the guard's EXISTS reads: status plus liveness evidence. */
+type StubRun = { status: string; lastOutputAt?: string | null; startedAt?: string | null; createdAt?: string | null; controllerLeaseExpiresAt?: string | null };
 
 /**
  * Fixture db emulating the wake bridge's `agent_wakeup_requests` queries: the
@@ -84,15 +86,17 @@ const SETTLED_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out", "
  * the in-flight guard filters company + live status (selects id), and the
  * post-wake check filters exact key + delivered status (selects id). The
  * guard mirrors production: a live receipt holds the slot while its linked
- * run (from `runs`) is unsettled, or within the stale window when no
- * unsettled run is linked; terminal receipts hold it through the cooldown.
+ * run (from `runs`) is open AND still shows liveness (unexpired controller
+ * lease or an activity clock inside the stale window), or while the receipt
+ * itself is inside the stale window; terminal receipts hold it through the
+ * cooldown.
  */
 function wakeBridgeDb(options: {
   ceo: { id: string; companyId: string; role: string; status: string; adapterType: string };
   companyId: string;
   key: string;
   receipts: WakeReceipt[];
-  runs: Record<string, string>;
+  runs: Record<string, StubRun>;
   standingIssues: Array<{ id: string }>;
   postWake: { current: boolean };
 }) {
@@ -105,16 +109,21 @@ function wakeBridgeDb(options: {
       if (keys.includes("status")) return options.receipts.filter((receipt) => receipt.idempotencyKey === options.key);
       if (options.postWake.current) return options.receipts.filter((receipt) => receipt.idempotencyKey === options.key
         && DELIVERED_WAKE_STATUSES.includes(receipt.status));
-      // Guard: live wakes hold the slot while their linked run is unsettled
-      // (mirrors production's EXISTS over heartbeat_runs) or, when no
-      // unsettled run is linked, within the stale window; terminal wakes hold
-      // it through the cooldown.
+      // Guard: live wakes hold the slot while their linked run is open AND
+      // demonstrates liveness (mirrors production's EXISTS over
+      // heartbeat_runs with the lease/activity-clock predicate), or while the
+      // receipt itself is inside the stale window; terminal wakes hold it
+      // through the cooldown.
       return options.receipts.filter((receipt) => {
         if (receipt.companyId !== options.companyId) return false;
         if (LIVE_WAKE_STATUSES.includes(receipt.status)) {
-          const runStatus = receipt.runId !== null ? options.runs[receipt.runId] : undefined;
-          const runStillOpen = runStatus !== undefined && !SETTLED_RUN_STATUSES.includes(runStatus);
-          return runStillOpen || Date.parse(receipt.updatedAt) >= Date.now() - PUBSUB_WAKE_STALE_MS;
+          const run = receipt.runId !== null ? options.runs[receipt.runId] : undefined;
+          const runStillOpen = run !== undefined && !SETTLED_RUN_STATUSES.includes(run.status);
+          const activityClock = run ? run.lastOutputAt ?? run.startedAt ?? run.createdAt ?? null : null;
+          const runLive = runStillOpen && run !== undefined && (
+            (run.controllerLeaseExpiresAt != null && Date.parse(run.controllerLeaseExpiresAt) >= Date.now())
+            || (activityClock != null && Date.parse(activityClock) >= Date.now() - PUBSUB_WAKE_STALE_MS));
+          return runLive || Date.parse(receipt.updatedAt) >= Date.now() - PUBSUB_WAKE_STALE_MS;
         }
         return ["completed", "failed"].includes(receipt.status) && receipt.finishedAt !== null
           && Date.parse(receipt.finishedAt) >= Date.now() - PUBSUB_WAKE_COOLDOWN_MS;
@@ -144,7 +153,7 @@ describe("PubSub wake task scope for native-runner CEOs", () => {
   const ceoId = randomUUID();
   const coordinationIssue = { id: randomUUID(), title: "PubSub Coordination" };
 
-  function wakeHarness(options: { adapterType: string; receipts?: ReceiptSeed[]; standingIssueId?: string; runs?: Record<string, string>; topic?: string }) {
+  function wakeHarness(options: { adapterType: string; receipts?: ReceiptSeed[]; standingIssueId?: string; runs?: Record<string, StubRun>; topic?: string }) {
     const companyId = randomUUID();
     const message = {
       id: randomUUID(), topic: options.topic ?? "fleet.chat.workload", payload: deliveredMessage.payload,
@@ -301,18 +310,35 @@ describe("PubSub wake task scope for native-runner CEOs", () => {
     expect(seen).toHaveLength(1);
   });
 
-  it("keeps deferring while a live PubSub receipt's linked run is still open (healthy long wake)", async () => {
+  it("keeps deferring while a live PubSub receipt's linked run still shows liveness (healthy long wake)", async () => {
     const otherKey = `pubsub:${randomUUID()}:${randomUUID()}:${randomUUID()}:${randomUUID()}`;
     const runId = randomUUID();
     const { db, heartbeat, seen, message, companyId } = wakeHarness({
       adapterType: "claude_local",
       // A healthy wake running well past the stale window: its receipt is old
-      // but the linked run is still open, so it must keep holding the slot.
-      runs: { [runId]: "running" },
+      // but the linked run is open and producing provider output, so it must
+      // keep holding the slot.
+      runs: { [runId]: { status: "running", startedAt: new Date(Date.now() - 3_600_000).toISOString(), lastOutputAt: new Date(Date.now() - 5_000).toISOString() } },
       receipts: [{ status: "running", runId, updatedAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 600_000)).toISOString(), idempotencyKey: otherKey }],
     });
     await expect(createPubsubWake(db, heartbeat)(companyId, message)).rejects.toThrow("in flight");
     expect(seen).toHaveLength(0);
+  });
+
+  it("re-allows a wake once a stale live PubSub receipt's linked run lost liveness (SIGKILL orphan)", async () => {
+    const otherKey = `pubsub:${randomUUID()}:${randomUUID()}:${randomUUID()}:${randomUUID()}`;
+    const runId = randomUUID();
+    const { db, heartbeat, seen, message, companyId } = wakeHarness({
+      adapterType: "claude_local",
+      // The stuck-receipt defect: the wake owner was SIGKILL'd mid-flight, so
+      // the receipt stayed `claimed` while the run sits parked non-terminal
+      // forever. Once the receipt AND every liveness signal on the run age
+      // past the stale window, the slot must be released for new wakes.
+      runs: { [runId]: { status: "running", startedAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 600_000)).toISOString(), lastOutputAt: null, createdAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 600_000)).toISOString(), controllerLeaseExpiresAt: null } },
+      receipts: [{ status: "claimed", runId, updatedAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 1_000)).toISOString(), idempotencyKey: otherKey }],
+    });
+    await createPubsubWake(db, heartbeat)(companyId, message);
+    expect(seen).toHaveLength(1);
   });
 
   it("re-allows a wake once a stale live PubSub receipt's linked run has settled", async () => {
@@ -323,7 +349,7 @@ describe("PubSub wake task scope for native-runner CEOs", () => {
       // A live receipt older than the stale window whose run already settled:
       // the receipt no longer holds the slot even if reconciliation has not
       // yet settled the receipt itself.
-      runs: { [runId]: "succeeded" },
+      runs: { [runId]: { status: "succeeded" } },
       receipts: [{ status: "running", runId, updatedAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 1_000)).toISOString(), idempotencyKey: otherKey }],
     });
     await createPubsubWake(db, heartbeat)(companyId, message);

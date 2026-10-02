@@ -10,6 +10,8 @@
 
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
 
+- A SIGKILL-orphaned PubSub wake no longer blocks a company's wake slot forever: the coalescing guard now holds the slot only while the wake's linked run shows liveness (an unexpired controller lease, recent provider output, or a recent start inside the stale window), so a receipt stuck non-terminal beside a parked orphan releases the slot once it ages out, and the service sweep reconciles those orphaned receipts to a terminal state without restarting the cooldown. Healthy long-running wakes still hold the slot for their whole run.
+
 ## 0.3.1
 
 ### Patch Changes

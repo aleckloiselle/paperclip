@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, exists, gte, inArray, isNull, like, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gte, inArray, isNull, like, notInArray, or, sql, type SQL } from "drizzle-orm";
 import { agents, agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import type { PubsubInboundMessage } from "./pubsub.js";
 import { issueService } from "./issues.js";
@@ -13,15 +13,37 @@ export const PUBSUB_DELIVERED_WAKE_STATUSES = [...LIVE_WAKE_STATUSES, "completed
 export const PUBSUB_BUDGET_PAUSE_CANCELLATION = "Cancelled due to budget pause";
 /**
  * Run statuses meaning the heartbeat core has settled the linked run. Mirrors the
- * receipt-reconciliation sweep in the PubSub service: a live wake receipt whose
- * run has settled no longer holds the company's wake slot — the platform's own
- * recovery (controller-lease expiry, the periodic orphan reaper, and that
- * reconciliation) is what transitions the run into these statuses, so slot
- * release tracks the platform's recovery instead of an arbitrary clock.
+ * receipt-reconciliation sweeps in the PubSub service: a live wake receipt whose
+ * run has settled no longer holds the company's wake slot. Recovery can also
+ * preserve a run non-terminal indefinitely (ownership evidence pending), so the
+ * guard and the sweeps additionally read the run's own liveness evidence:
+ * see pubsubRunIsLive.
  */
 export const PUBSUB_SETTLED_RUN_STATUSES = [
   "succeeded", "failed", "cancelled", "timed_out", "interrupted", "skipped",
 ] as const;
+
+/**
+ * Whether a wake receipt's linked run is actually live right now, judged from
+ * the platform's own liveness evidence rather than "status not terminal": a
+ * legacy controller still renewing its 60-second lease, or recent movement on
+ * the run's activity clock (last provider output, else start, else creation —
+ * the clock the output-silence watchdog and the shared-workspace holder use).
+ * A run orphaned by a SIGKILL — or deliberately parked by recovery while
+ * ownership evidence is pending — stops producing evidence but never settles;
+ * without this bound such a run would hold its receipt, the company's wake
+ * slot, and every inbound delivery's 429 indefinitely. The wake guard and the
+ * orphan-reconciliation sweep share this verdict, consistent with the 60s
+ * stale-claim convention in dispatchPendingNativeStatusWakeups.
+ */
+export function pubsubRunIsLive(now: Date): SQL {
+  const staleCutoff = new Date(now.getTime() - PUBSUB_WAKE_STALE_MS);
+  return or(
+    sql`${heartbeatRuns.controllerLeaseExpiresAt} is not null and ${heartbeatRuns.controllerLeaseExpiresAt} > ${now.toISOString()}::timestamptz`,
+    sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${staleCutoff.toISOString()}::timestamptz`,
+  )!;
+}
+
 /**
  * Task-state journal topics: the activity journal's signed peer traffic. The
  * PubSub receiver persists every inbound message to inbox/history before this
@@ -124,18 +146,22 @@ export function createPubsubWake(db: Db, heartbeat: PubsubHeartbeat) {
     // guard to recently settled wakes, bounding sustained CEO execution to
     // one run per company per window instead of one per completed message.
     //
-    // The live clause is bound to the linked run's liveness, not just receipt
-    // age: a receipt whose run the platform's own recovery (controller-lease
-    // expiry, the periodic orphan reaper, receipt reconciliation) has not
-    // settled holds the slot even past the stale window — a healthy
-    // long-running CEO wake must not release the slot mid-run and admit a
-    // second, non-coalesced wake. Live receipts without a settled-run link
-    // (not yet claimed by a run) fall back to the stale window, which bounds
-    // the slot for owners that died before their run settled; the per-agent
-    // concurrency policy and the PubSub rate/pending-wake limits still bound
-    // any wake admitted past the guard.
+    // The live clause is bound to the linked run's demonstrated liveness, not
+    // merely to its non-terminal status: a healthy long-running CEO wake keeps
+    // producing liveness evidence (controller-lease renewals, provider output,
+    // a recent start) and holds the slot even past the stale window, so it
+    // must not release the slot mid-run and admit a second, non-coalesced
+    // wake. A run orphaned by a SIGKILL — or preserved by recovery while
+    // ownership evidence is pending — stops producing evidence and never
+    // settles on its own; once the receipt itself ages past the stale window
+    // the slot is free again, the same 60s bound as the stale-claim
+    // convention in dispatchPendingNativeStatusWakeups. Live receipts with no
+    // linked run fall back to the stale window alone; the per-agent
+    // concurrency policy and the wake admission deferral still bound any wake
+    // admitted past the guard.
     await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`pubsub-wake:${companyId}`}, 0))`);
+      const guardNow = new Date();
       const [blockedCompanyWake] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, companyId),
         like(agentWakeupRequests.idempotencyKey, `pubsub:${companyId}:%`),
@@ -148,13 +174,14 @@ export function createPubsubWake(db: Db, heartbeat: PubsubHeartbeat) {
                   .where(and(
                     eq(heartbeatRuns.id, agentWakeupRequests.runId),
                     notInArray(heartbeatRuns.status, [...PUBSUB_SETTLED_RUN_STATUSES]),
+                    pubsubRunIsLive(guardNow),
                   )),
               ),
-              gte(agentWakeupRequests.updatedAt, new Date(Date.now() - PUBSUB_WAKE_STALE_MS)),
+              gte(agentWakeupRequests.updatedAt, new Date(guardNow.getTime() - PUBSUB_WAKE_STALE_MS)),
             ),
           ),
           and(inArray(agentWakeupRequests.status, ["completed", "failed"]),
-            gte(agentWakeupRequests.finishedAt, new Date(Date.now() - PUBSUB_WAKE_COOLDOWN_MS))),
+            gte(agentWakeupRequests.finishedAt, new Date(guardNow.getTime() - PUBSUB_WAKE_COOLDOWN_MS))),
         ),
       )).limit(1);
       if (blockedCompanyWake) throw new Error("PubSub wake coalesced: another PubSub wake is in flight or recently settled for this company");

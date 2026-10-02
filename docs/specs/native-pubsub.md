@@ -169,10 +169,18 @@ Terminology:
   live, or recently settled within the bounded post-settlement cooldown, further
   messages MUST be deferred with durable backpressure rather than forking
   concurrent CEO runs, bounding sustained CEO execution to one run per company per
-  window. A live wake's slot hold MUST track its linked run's liveness — held while
-  the run is unsettled, so a healthy long-running wake cannot be bypassed by a
-  second message — and receipts without an unsettled run link MUST be bounded by a
-  stale window so a crashed owner cannot hold the slot indefinitely. The guard MUST
+  window. A live wake's slot hold MUST track demonstrated liveness of its
+  linked run — held while the run still shows liveness evidence (an unexpired
+  controller lease, recent provider output, or a recent start, inside a stale
+  window), so a healthy long-running wake cannot be bypassed by a second
+  message — and MUST release the slot once both the receipt and every
+  liveness signal on the run age past that stale window, because recovery may
+  preserve an ownership-ambiguous orphan non-terminal indefinitely. Receipts
+  whose run settled, and receipts without a run link, MUST likewise be bounded
+  by the stale window so a crashed owner cannot hold the slot indefinitely;
+  orphaned receipts (stale receipt, run without liveness evidence) MUST be
+  reconciled to terminal state by the service sweep without restarting the
+  cooldown. The guard MUST
   run under a company-scoped advisory lock so concurrent server instances cannot
   both enqueue before either commits. A queued wake cancelled by a heartbeat budget
   pause MUST be redelivered after the pause lifts; an intentional operator stop remains

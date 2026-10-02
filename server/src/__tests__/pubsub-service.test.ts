@@ -486,18 +486,36 @@ describeEmbeddedPostgres("PubSub wake guard run liveness", () => {
     };
   }
 
-  /** Seed a live PubSub wake receipt plus its linked run, both aged past the stale window. */
-  async function seedAgedLiveWake(runStatus: string, options: { runFinishedAt?: Date } = {}) {
+  /**
+   * Seed a live PubSub wake receipt plus its linked run, the receipt aged past
+   * the stale window. Run liveness evidence is controlled by options: by
+   * default none (activity clock aged, controller lease absent — a SIGKILL
+   * orphan), with optional fresh provider output or an unexpired lease.
+   */
+  async function seedAgedLiveWake(
+    runStatus: string,
+    options: {
+      runFinishedAt?: Date;
+      receiptStatus?: string;
+      receiptUpdatedAt?: Date;
+      lastOutputAt?: Date | null;
+      controllerLeaseExpiresAt?: Date | null;
+    } = {},
+  ) {
     const ageMs = PUBSUB_WAKE_STALE_MS + 600_000;
     const old = new Date(Date.now() - ageMs);
     const [wake] = await db.insert(agentWakeupRequests).values({
       companyId, agentId: ceoId, source: "automation", reason: "pubsub_message",
-      status: "running", claimedAt: old, requestedAt: old, updatedAt: old, runId: null,
+      status: options.receiptStatus ?? "running", claimedAt: old, requestedAt: old,
+      updatedAt: options.receiptUpdatedAt ?? old, runId: null,
       idempotencyKey: `pubsub:${companyId}:${randomUUID()}:${randomUUID()}:${randomUUID()}`,
     }).returning();
     const [run] = await db.insert(heartbeatRuns).values({
       companyId, agentId: ceoId, status: runStatus,
       startedAt: old, finishedAt: options.runFinishedAt ?? null,
+      lastOutputAt: options.lastOutputAt ?? null,
+      controllerLeaseExpiresAt: options.controllerLeaseExpiresAt ?? null,
+      createdAt: old,
       wakeupRequestId: wake.id,
     }).returning();
     await db.update(agentWakeupRequests).set({ runId: run.id }).where(eq(agentWakeupRequests.id, wake.id));
@@ -523,9 +541,10 @@ describeEmbeddedPostgres("PubSub wake guard run liveness", () => {
 
   it("keeps a healthy long-running wake holding the company slot past the stale window", async () => {
     // The receipt is far older than the stale window, but its linked run is
-    // still open — the platform's own recovery has not settled it, so the
-    // slot must stay held and no second, non-coalesced wake may enqueue.
-    await seedAgedLiveWake("running");
+    // still open and emitting fresh provider output — live liveness evidence,
+    // so the slot must stay held and no second, non-coalesced wake may
+    // enqueue even though recovery has not settled the run.
+    await seedAgedLiveWake("running", { lastOutputAt: new Date(Date.now() - 10_000) });
     const { heartbeat, calls } = recordingHeartbeat();
     await expect(createPubsubWake(db, heartbeat)(companyId, inboundMessage))
       .rejects.toThrow("in flight");
@@ -544,6 +563,133 @@ describeEmbeddedPostgres("PubSub wake guard run liveness", () => {
     const { heartbeat, calls } = recordingHeartbeat();
     await createPubsubWake(db, heartbeat)(companyId, inboundMessage);
     expect(calls).toHaveLength(1);
+  });
+
+  it("releases the company slot for a stale claimed wake whose open run lost liveness (SIGKILL orphan)", async () => {
+    // The defect: the wake owner was SIGKILL'd mid-flight. The receipt stays
+    // `claimed` with no finished time and the linked run sits parked
+    // non-terminal — recovery preserves ownership evidence indefinitely — so
+    // it neither settles nor shows any liveness. Once the receipt itself ages
+    // past the stale window the slot must be released again, or one stuck
+    // receipt turns every inbound delivery into a 429 forever.
+    await seedAgedLiveWake("running", { receiptStatus: "claimed" });
+    const { heartbeat, calls } = recordingHeartbeat();
+    await createPubsubWake(db, heartbeat)(companyId, inboundMessage);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("keeps a fresh live wake holding the company slot even without run evidence", async () => {
+    // A wake claimed moments ago (inside the stale window) holds the slot
+    // regardless of the run's evidence state: the guard is first an in-flight
+    // and burst-dedup protection.
+    await seedAgedLiveWake("running", {
+      receiptStatus: "claimed",
+      receiptUpdatedAt: new Date(Date.now() - 5_000),
+      lastOutputAt: null,
+    });
+    const { heartbeat, calls } = recordingHeartbeat();
+    await expect(createPubsubWake(db, heartbeat)(companyId, inboundMessage))
+      .rejects.toThrow("in flight");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("holds the company slot through the cooldown for a recently settled terminal wake", async () => {
+    // Terminal receipts keep the documented cooldown: its run already settled,
+    // yet a second wake must still wait out the window.
+    await db.insert(agentWakeupRequests).values({
+      companyId, agentId: ceoId, source: "automation", reason: "pubsub_message",
+      status: "completed", requestedAt: new Date(Date.now() - 30_000),
+      updatedAt: new Date(), finishedAt: new Date(Date.now() - 10_000),
+      idempotencyKey: `pubsub:${companyId}:${randomUUID()}:${randomUUID()}:${randomUUID()}`,
+    });
+    const { heartbeat, calls } = recordingHeartbeat();
+    await expect(createPubsubWake(db, heartbeat)(companyId, inboundMessage))
+      .rejects.toThrow("recently settled");
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describeEmbeddedPostgres("PubSub wake orphan reconciliation", () => {
+  let tempDb: EmbeddedPostgresTestDatabase | null = null;
+  let db: Db;
+  let service: PubsubService;
+  let identityDir: string;
+  let companyId: string;
+  let ceoId: string;
+
+  async function seedPair(options: { receiptStatus: string; receiptAgeMs: number; runStatus: string; lastOutputAt: Date | null }) {
+    const old = new Date(Date.now() - PUBSUB_WAKE_STALE_MS - 600_000);
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId, agentId: ceoId, source: "automation", reason: "pubsub_message",
+      status: options.receiptStatus, claimedAt: old, requestedAt: old,
+      updatedAt: new Date(Date.now() - options.receiptAgeMs), runId: null,
+      idempotencyKey: `pubsub:${companyId}:${randomUUID()}:${randomUUID()}:${randomUUID()}`,
+    }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId, agentId: ceoId, status: options.runStatus,
+      startedAt: old, lastOutputAt: options.lastOutputAt, createdAt: old,
+      wakeupRequestId: wake.id,
+    }).returning();
+    await db.update(agentWakeupRequests).set({ runId: run.id }).where(eq(agentWakeupRequests.id, wake.id));
+    return wake.id;
+  }
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pubsub-orphan-");
+    db = createDb(tempDb.connectionString);
+    identityDir = await mkdtemp(path.join(tmpdir(), "paperclip-pubsub-orphan-identity-"));
+    const local = generateKeyPairSync("ed25519");
+    const identityPath = path.join(identityDir, "identity.json");
+    await writeFile(identityPath, JSON.stringify({
+      version: 1, instanceId: randomUUID(),
+      privateKey: local.privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    }), { mode: 0o600 });
+    service = createPubsubService(db, { identityPath, wake: async () => {} });
+    companyId = randomUUID();
+    ceoId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Orphan fixture", issuePrefix: "OR" });
+    await db.insert(agents).values({ id: ceoId, companyId, name: "Orphan CEO", role: "ceo", status: "active", adapterType: "paperclip_runner" });
+  }, 30_000);
+
+  afterEach(async () => {
+    await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+  });
+
+  afterAll(async () => {
+    await rm(identityDir, { recursive: true, force: true });
+    await tempDb?.cleanup();
+  });
+
+  it("finalizes an orphaned wake receipt whose run lost every liveness signal", async () => {
+    const wakeId = await seedPair({ receiptStatus: "claimed", receiptAgeMs: PUBSUB_WAKE_STALE_MS + 10_000, runStatus: "running", lastOutputAt: null });
+    const stop = await service.start();
+    try {
+      await sleep(700);
+    } finally {
+      await stop();
+    }
+    const [row] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(row.status).toBe("failed");
+    expect(row.error).toContain("lost liveness");
+    // The finished stamp reuses the already-stale receipt touch, so
+    // finalizing an orphan does not restart the guard cooldown for a wake
+    // that never executed.
+    expect(row.finishedAt!.getTime()).toBeLessThanOrEqual(Date.now() - PUBSUB_WAKE_STALE_MS);
+  });
+
+  it("leaves receipts untouched while their run is live or the wake is fresh", async () => {
+    const healthy = await seedPair({ receiptStatus: "running", receiptAgeMs: PUBSUB_WAKE_STALE_MS + 10_000, runStatus: "running", lastOutputAt: new Date() });
+    const fresh = await seedPair({ receiptStatus: "claimed", receiptAgeMs: 5_000, runStatus: "running", lastOutputAt: null });
+    const stop = await service.start();
+    try {
+      await sleep(700);
+    } finally {
+      await stop();
+    }
+    const rows = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status }).from(agentWakeupRequests);
+    expect(rows.find((r) => r.id === healthy)!.status).toBe("running");
+    expect(rows.find((r) => r.id === fresh)!.status).toBe("claimed");
   });
 });
 

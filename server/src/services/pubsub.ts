@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, eq, gte, gt, inArray, isNull, isNotNull, like, lte, ne, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, gt, inArray, isNull, isNotNull, like, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import {
   agentWakeupRequests, agents, activityLog, companies, heartbeatRuns, pubsubActivityReceipts, pubsubMessages, pubsubNonces, pubsubObservers,
   pubsubOutbox, pubsubSubscriptions, pubsubTrust, type Db,
@@ -15,6 +15,7 @@ import {
   PUBSUB_PEER_MAX_RATE_MESSAGES,
   PUBSUB_RATE_WINDOW_MS,
   PUBSUB_VISIBILITY_TIMEOUT_MS,
+  PUBSUB_WAKE_STALE_MS,
   pubsubEnvelopeSchema,
   pubsubIdSchema,
   pubsubPublishSchema,
@@ -33,7 +34,7 @@ export { ensurePubsubIdentity } from "./pubsub-identity.js";
 import { logActivity } from "./activity-log.js";
 import { assertPublicRemoteHttpEndpoint, type RemoteHttpEndpointLookup } from "./remote-http-endpoint-guard.js";
 import { guardedRemoteHttpFetch } from "./remote-http-fetch.js";
-import { PUBSUB_BUDGET_PAUSE_CANCELLATION, PUBSUB_DELIVERED_WAKE_STATUSES, PUBSUB_SETTLED_RUN_STATUSES } from "./pubsub-wake.js";
+import { PUBSUB_BUDGET_PAUSE_CANCELLATION, PUBSUB_DELIVERED_WAKE_STATUSES, PUBSUB_SETTLED_RUN_STATUSES, pubsubRunIsLive } from "./pubsub-wake.js";
 
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Trust = typeof pubsubTrust.$inferSelect;
@@ -403,6 +404,54 @@ export function createPubsubService(db: Db, options: PubsubServiceOptions = {}):
   }
 
   /**
+   * Finalize PubSub wake receipts orphaned together with their run: the
+   * linked run is still open but has stopped producing every liveness
+   * signal, and the receipt itself has aged past the stale window. Recovery
+   * deliberately parks ownership-ambiguous runs (SIGKILL'd controllers,
+   * providers whose authority cannot be verified) non-terminal until an
+   * operator resolves them, so the settled-run reconciliation above can
+   * never reach those pairs; without this sweep their receipts would stay
+   * non-terminal forever. The verdict mirrors the wake guard's
+   * (pubsubRunIsLive), so the sweep never contradicts a receipt the guard
+   * still treats as holding the company slot. The run keeps its own state:
+   * if recovery later re-adopts it, its executor path overwrites this
+   * receipt with the run's real outcome. `finishedAt` comes from the
+   * receipt's last touch — already outside the cooldown window — so
+   * finalizing an orphan does not re-block the slot for a wake that never
+   * executed. `deferred_issue_execution` is excluded: those receipts are
+   * owned by the issue-execution recovery, not by run settlement.
+   */
+  async function reconcileOrphanedWakeReceipts(): Promise<void> {
+    if (!options.wake) return;
+    const now = new Date();
+    const orphaned = await db
+      .select({ wake: agentWakeupRequests, run: heartbeatRuns })
+      .from(agentWakeupRequests)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, agentWakeupRequests.runId))
+      .where(and(
+        like(agentWakeupRequests.idempotencyKey, "pubsub:%"),
+        inArray(agentWakeupRequests.status, ["queued", "claimed", "coalesced", "running"]),
+        isNotNull(agentWakeupRequests.runId),
+        lte(agentWakeupRequests.updatedAt, new Date(now.getTime() - PUBSUB_WAKE_STALE_MS)),
+        notInArray(heartbeatRuns.status, [...PUBSUB_SETTLED_RUN_STATUSES]),
+        sql`not (${pubsubRunIsLive(now)})`,
+      ))
+      .limit(16);
+    for (const { wake, run } of orphaned) {
+      const updated = await db.update(agentWakeupRequests).set({
+        status: "failed",
+        finishedAt: wake.updatedAt ?? now,
+        error: "Orphaned wake: the linked run lost liveness without finalizing",
+        updatedAt: now,
+      }).where(and(
+        eq(agentWakeupRequests.id, wake.id),
+        inArray(agentWakeupRequests.status, ["queued", "claimed", "coalesced", "running"]),
+      )).returning({ id: agentWakeupRequests.id });
+      if (updated.length > 0) logger.info({ wakeId: wake.id, runId: run.id, runStatus: run.status }, "PubSub wake receipt finalized as orphaned");
+    }
+  }
+
+  /**
    * Bounded retention: expire the replay nonce cache and pruned inbox history.
    * A message whose mandatory CEO wake is still pending is never swept, no
    * matter how long ago it was acked — the wake must be redelivered when a
@@ -419,7 +468,7 @@ export function createPubsubService(db: Db, options: PubsubServiceOptions = {}):
   }
   function tick(): void {
     if (running) return;
-    running = Promise.allSettled([deliverPending(), rearmCancelledWakes(), reconcileSettledWakeReceipts(), wakePending(), sweepRetention()]).then((results) => {
+    running = Promise.allSettled([deliverPending(), rearmCancelledWakes(), reconcileSettledWakeReceipts(), reconcileOrphanedWakeReceipts(), wakePending(), sweepRetention()]).then((results) => {
       for (const result of results) {
         if (result.status === "rejected") logger.error({ err: result.reason }, "PubSub worker tick failed; durable work retained");
       }

@@ -376,11 +376,19 @@ Wakes are coalesced per company: while any PubSub wake for the company is in fli
 settled within the post-settlement cooldown window (60 s, `PUBSUB_WAKE_COOLDOWN_MS`), further messages are deferred with
 durable backpressure (the wake worker retries with the same backoff schedule) instead of
 forking a concurrent CEO run, bounding sustained CEO execution to one run per company per
-window. An in-flight wake holds its slot for as long as its linked run is unsettled, so a
-healthy long-running wake is never bypassed by a second message; receipts whose run the
-platform's own recovery (controller-lease expiry, the periodic orphan reaper, and receipt
-reconciliation) has settled — or that have no run link yet — are bounded by a 60 s stale
-window (`PUBSUB_WAKE_STALE_MS`) instead, so a crashed owner cannot hold the slot indefinitely. The guard runs
+window. An in-flight wake holds its slot while its linked run shows liveness —
+an unexpired controller-lease renewal, recent provider output, or a recent start
+(inside the 60 s window) — so a healthy long-running wake is never bypassed by a
+second message. A wake whose run the platform's own recovery (controller-lease
+expiry, the periodic orphan reaper, and receipt reconciliation) has settled, or
+one whose run shows no liveness at all — a SIGKILL orphan, or a run recovery
+preserves non-terminal while ownership evidence is pending — stops holding the
+slot once the receipt itself ages past the 60 s stale window
+(`PUBSUB_WAKE_STALE_MS`); a worker sweep then reconciles such orphaned receipts
+to terminal state, finished at the already-elapsed receipt touch so finalizing
+an orphan never re-blocks the slot. Receipts with no run link are bounded by the
+same stale window, so a crashed owner cannot hold the slot indefinitely. The
+guard runs
 under a company-scoped advisory lock so concurrent server instances cannot both enqueue
 before either commits.
 
