@@ -2059,6 +2059,13 @@
       "when": 1790808269311,
       "tag": "0295_cultured_inertia",
       "breakpoints": true
+    },
+    {
+      "idx": 296,
+      "version": "7",
+      "when": 1790988299748,
+      "tag": "0296_awesome_jean_grey",
+      "breakpoints": true
     }
   ]
 }

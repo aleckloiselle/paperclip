@@ -142,11 +142,14 @@ function retryDelay(attempts: number): number {
 /**
  * A delivery failure whose `permanent` verdict says it will not self-heal:
  * the peer HTTP-rejected the envelope (4xx other than 429 backpressure) or
- * the egress guard rejected the destination (private/reserved address the
- * operator has not allowlisted). Only permanent failures consume the delivery
- * attempt budget; transient failures (peer offline, connection refused,
- * timeouts, 5xx, 429) retry indefinitely with capped backoff, so a peer
- * outage of any length never loses a queued message to budget exhaustion.
+ * the egress guard's *policy* rejected the destination (a private/reserved
+ * address the operator has not allowlisted, or an unapproved rebinding
+ * answer). Only permanent rejections accumulate toward the delivery budget;
+ * everything else — peer offline, connection refused, DNS failure, connect
+ * or response timeouts, 5xx, 429 — is transient and retries indefinitely
+ * with capped backoff, so a peer outage of any length never loses a queued
+ * message to budget exhaustion, and a peer that was offline past the budget
+ * is judged on its permanent rejections alone when it returns.
  */
 class PubsubDeliveryError extends Error {
   constructor(message: string, readonly permanent: boolean) {
@@ -160,6 +163,10 @@ export function createPubsubService(db: Db, options: PubsubServiceOptions = {}):
   // Operator-managed private-peer allowlist. Peer URLs are tenant-controlled
   // (board-scope trust writes), so egress to loopback, RFC1918, CGNAT, and other
   // private/reserved space is denied by default; an operator opts in per host.
+  // Lookups use Object.hasOwn: a bare property read would accept inherited
+  // properties, so a peer URL hostname such as `constructor` would read
+  // Object.prototype as an operator allowlist entry and enable private egress
+  // the operator never granted.
   const privatePeerHosts: Record<string, true> = Object.fromEntries(
     (options.privatePeerHosts ?? (process.env.PAPERCLIP_PUBSUB_ALLOWED_PRIVATE_HOSTS ?? "").split(/[,\s]+/))
       .map((host) => host.trim().toLowerCase().replace(/\.$/, ""))
@@ -242,34 +249,46 @@ export function createPubsubService(db: Db, options: PubsubServiceOptions = {}):
           const response = await guardedRemoteHttpFetch(url, {
             method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(envelope),
           }, {
-            allowPrivateNetwork: Boolean(privatePeerHosts[new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase()]),
+            allowPrivateNetwork: Object.hasOwn(privatePeerHosts, new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase()),
             lookup: options.peerDnsLookup,
             connectTimeoutMs: 5000,
             responseTimeoutMs: 5000,
-            error: (guardMessage) => new PubsubDeliveryError(`PubSub peer egress rejected: ${guardMessage}`, true),
+            // Only the egress policy verdict is permanent: a private/reserved
+            // destination the operator has not allowlisted, or a rebinding
+            // answer to an unapproved address, will not self-heal. DNS
+            // failure, connect failure, and response timeouts are
+            // network-level and do, so they retry without consuming the
+            // permanent-failure budget.
+            error: (guardMessage, code) => new PubsubDeliveryError(`PubSub peer egress rejected: ${guardMessage}`,
+              code === "remote_http_private_endpoint"),
           });
           await response.body?.cancel();
           // A peer HTTP rejection of the envelope (4xx other than 429
-          // backpressure) will not self-heal; network-level failures, 5xx, and
-          // 429 will, so only the former consumes the delivery budget.
+          // backpressure) will not self-heal; network-level failures, 5xx,
+          // and 429 will, so only the former accumulates permanent
+          // rejections.
           if (!response.ok) throw new PubsubDeliveryError(`PubSub peer returned HTTP ${response.status}`,
             response.status >= 400 && response.status < 500 && response.status !== 429);
           await tx.update(pubsubOutbox).set({ attempts: row.attempts + 1, deliveredAt: new Date(), lastError: null }).where(eq(pubsubOutbox.id, row.id));
         } catch (error) {
+          // `attempts` counts every dispatch attempt and drives the backoff;
+          // only permanent rejections accumulate toward the delivery budget,
+          // so a peer offline for any length of time cannot spend it: its
+          // queued messages deliver on return, and the first permanent
+          // rejection after an outage is judged on its own merits.
           const attempts = row.attempts + 1;
           const lastError = (error instanceof Error ? error.message : String(error)).slice(0, 900);
           const permanent = error instanceof PubsubDeliveryError && error.permanent;
-          if (attempts >= PUBSUB_DELIVERY_MAX_ATTEMPTS && permanent) {
-            // Delivery budget exhausted on a permanent rejection: abandon the
-            // delivery with a visible error instead of retrying forever (the
-            // message itself stays in history). Transient failures never
-            // consume the budget, so a peer outage of any length cannot lose a
-            // queued message — it redelivers when the peer comes back.
-            await tx.update(pubsubOutbox).set({ attempts, cancelledAt: new Date(),
-              lastError: (lastError + " (delivery budget exhausted: " + attempts + " attempts)").slice(0, 1000),
+          const permanentFailures = permanent ? row.permanentFailures + 1 : row.permanentFailures;
+          if (permanentFailures >= PUBSUB_DELIVERY_MAX_ATTEMPTS) {
+            // Permanent-rejection budget exhausted: abandon the delivery with
+            // a visible error instead of retrying forever (the message
+            // itself stays in history for operator re-publish).
+            await tx.update(pubsubOutbox).set({ attempts, permanentFailures, cancelledAt: new Date(),
+              lastError: (lastError + " (delivery budget exhausted: " + permanentFailures + " permanent rejections)").slice(0, 1000),
             }).where(eq(pubsubOutbox.id, row.id));
           } else {
-            await tx.update(pubsubOutbox).set({ attempts,
+            await tx.update(pubsubOutbox).set({ attempts, permanentFailures,
               availableAt: new Date(Date.now() + retryDelay(row.attempts)),
               lastError,
             }).where(eq(pubsubOutbox.id, row.id));
@@ -412,14 +431,18 @@ export function createPubsubService(db: Db, options: PubsubServiceOptions = {}):
    * operator resolves them, so the settled-run reconciliation above can
    * never reach those pairs; without this sweep their receipts would stay
    * non-terminal forever. The verdict mirrors the wake guard's
-   * (pubsubRunIsLive), so the sweep never contradicts a receipt the guard
-   * still treats as holding the company slot. The run keeps its own state:
-   * if recovery later re-adopts it, its executor path overwrites this
-   * receipt with the run's real outcome. `finishedAt` comes from the
-   * receipt's last touch — already outside the cooldown window — so
-   * finalizing an orphan does not re-block the slot for a wake that never
-   * executed. `deferred_issue_execution` is excluded: those receipts are
-   * owned by the issue-execution recovery, not by run settlement.
+   * (pubsubRunIsLive) and is re-evaluated atomically inside each
+   * finalizing UPDATE: a run that re-adopts its session lease — or writes
+   * fresh output — between the select above and that statement is no
+   * longer an orphan, and its receipt keeps holding the company slot.
+   * Without that re-check a recovered wake would lose its slot while its
+   * run is still executing. The run keeps its own state: if recovery later
+   * re-adopts it, its executor path overwrites this receipt with the run's
+   * real outcome. `finishedAt` comes from the receipt's last touch —
+   * already outside the cooldown window — so finalizing an orphan does not
+   * re-block the slot for a wake that never executed.
+   * `deferred_issue_execution` is excluded: those receipts are owned by the
+   * issue-execution recovery, not by run settlement.
    */
   async function reconcileOrphanedWakeReceipts(): Promise<void> {
     if (!options.wake) return;
@@ -446,6 +469,16 @@ export function createPubsubService(db: Db, options: PubsubServiceOptions = {}):
       }).where(and(
         eq(agentWakeupRequests.id, wake.id),
         inArray(agentWakeupRequests.status, ["queued", "claimed", "coalesced", "running"]),
+        // Re-verify the orphan verdict at update time: the linked run must
+        // still be open AND still show no liveness evidence, so a run that
+        // regains evidence between the select and this statement keeps its
+        // receipt live.
+        sql`exists (
+          select 1 from ${heartbeatRuns}
+          where ${heartbeatRuns.id} = ${run.id}
+            and not ${inArray(heartbeatRuns.status, [...PUBSUB_SETTLED_RUN_STATUSES])}
+            and not (${pubsubRunIsLive(now)})
+        )`,
       )).returning({ id: agentWakeupRequests.id });
       if (updated.length > 0) logger.info({ wakeId: wake.id, runId: run.id, runStatus: run.status }, "PubSub wake receipt finalized as orphaned");
     }
@@ -494,7 +527,7 @@ export function createPubsubService(db: Db, options: PubsubServiceOptions = {}):
       // Dispatch re-validates on every attempt against the same policy.
       const deliveryUrl = new URL(values.url);
       await assertPublicRemoteHttpEndpoint(deliveryUrl, {
-        allowPrivateNetwork: Boolean(privatePeerHosts[deliveryUrl.hostname.replace(/^\[|\]$/g, "").toLowerCase()]),
+        allowPrivateNetwork: Object.hasOwn(privatePeerHosts, deliveryUrl.hostname.replace(/^\[|\]$/g, "").toLowerCase()),
         lookup: options.peerDnsLookup,
       }, (guardMessage) => badRequest(guardMessage));
       return db.transaction(async (tx) => {

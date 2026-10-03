@@ -7,7 +7,7 @@ import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
-  activityLog, agents, companies, createDb, heartbeatRuns, pubsubMessages, pubsubNonces, pubsubOutbox, pubsubSubscriptions, pubsubTrust, agentWakeupRequests, type Db,
+  activityLog, agents, companies, createDb, heartbeatRuns, issues, nativeRunFinalizations, pubsubMessages, pubsubNonces, pubsubOutbox, pubsubSubscriptions, pubsubTrust, agentWakeupRequests, type Db,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, type EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { PUBSUB_DELIVERY_MAX_ATTEMPTS, PUBSUB_MAX_PENDING_INBOX_BYTES, PUBSUB_MAX_PENDING_WAKES, PUBSUB_PEER_MAX_RATE_MESSAGES, PUBSUB_WAKE_STALE_MS } from "@paperclipai/shared";
@@ -489,8 +489,9 @@ describeEmbeddedPostgres("PubSub wake guard run liveness", () => {
   /**
    * Seed a live PubSub wake receipt plus its linked run, the receipt aged past
    * the stale window. Run liveness evidence is controlled by options: by
-   * default none (activity clock aged, controller lease absent — a SIGKILL
-   * orphan), with optional fresh provider output or an unexpired lease.
+   * default none (activity clock aged, controller lease absent, no native
+   * session lease — a SIGKILL orphan), with optional fresh provider output,
+   * an unexpired controller lease, or a native session-execution lease.
    */
   async function seedAgedLiveWake(
     runStatus: string,
@@ -500,6 +501,7 @@ describeEmbeddedPostgres("PubSub wake guard run liveness", () => {
       receiptUpdatedAt?: Date;
       lastOutputAt?: Date | null;
       controllerLeaseExpiresAt?: Date | null;
+      finalizationLeaseExpiresAt?: Date | null;
     } = {},
   ) {
     const ageMs = PUBSUB_WAKE_STALE_MS + 600_000;
@@ -518,6 +520,18 @@ describeEmbeddedPostgres("PubSub wake guard run liveness", () => {
       createdAt: old,
       wakeupRequestId: wake.id,
     }).returning();
+    if (options.finalizationLeaseExpiresAt !== undefined) {
+      // The finalization row is composite-keyed to (issue, run), so the
+      // fixture must provide a real issue and point the run at it.
+      const [fixtureIssue] = await db.insert(issues).values({
+        companyId, title: "Wake liveness fixture issue", status: "todo",
+      }).returning();
+      await db.update(heartbeatRuns).set({ nativeIssueId: fixtureIssue.id }).where(eq(heartbeatRuns.id, run.id));
+      await db.insert(nativeRunFinalizations).values({
+        runId: run.id, companyId, issueId: fixtureIssue.id,
+        phase: "observed", leaseExpiresAt: options.finalizationLeaseExpiresAt,
+      });
+    }
     await db.update(agentWakeupRequests).set({ runId: run.id }).where(eq(agentWakeupRequests.id, wake.id));
   }
 
@@ -531,8 +545,10 @@ describeEmbeddedPostgres("PubSub wake guard run liveness", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(nativeRunFinalizations);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issues);
   });
 
   afterAll(async () => {
@@ -578,6 +594,35 @@ describeEmbeddedPostgres("PubSub wake guard run liveness", () => {
     expect(calls).toHaveLength(1);
   });
 
+  it("keeps the company slot held while a stale live wake's run holds an unexpired native session lease", async () => {
+    // A CEO run in a quiet stretch — long tool call, no provider output, no
+    // legacy controller lease — is still being driven: the native session
+    // executor's execution lease is unexpired. The slot must stay held, not
+    // release just because the receipt aged past the stale window.
+    await seedAgedLiveWake("running", {
+      receiptStatus: "claimed",
+      finalizationLeaseExpiresAt: new Date(Date.now() + 10 * 60_000),
+    });
+    const { heartbeat, calls } = recordingHeartbeat();
+    await expect(createPubsubWake(db, heartbeat)(companyId, inboundMessage))
+      .rejects.toThrow("in flight");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("releases the company slot once a stale claimed wake's session lease has expired (orphan)", async () => {
+    // The same parked pair as the SIGKILL orphan, but with a session lease
+    // the dead controller stopped renewing: once the lease expires within
+    // its own TTL no liveness evidence remains, and the slot releases again
+    // — bounded by the platform's lease semantics, not held forever.
+    await seedAgedLiveWake("running", {
+      receiptStatus: "claimed",
+      finalizationLeaseExpiresAt: new Date(Date.now() - 60_000),
+    });
+    const { heartbeat, calls } = recordingHeartbeat();
+    await createPubsubWake(db, heartbeat)(companyId, inboundMessage);
+    expect(calls).toHaveLength(1);
+  });
+
   it("keeps a fresh live wake holding the company slot even without run evidence", async () => {
     // A wake claimed moments ago (inside the stale window) holds the slot
     // regardless of the run's evidence state: the guard is first an in-flight
@@ -617,7 +662,7 @@ describeEmbeddedPostgres("PubSub wake orphan reconciliation", () => {
   let companyId: string;
   let ceoId: string;
 
-  async function seedPair(options: { receiptStatus: string; receiptAgeMs: number; runStatus: string; lastOutputAt: Date | null }) {
+  async function seedPair(options: { receiptStatus: string; receiptAgeMs: number; runStatus: string; lastOutputAt: Date | null; finalizationLeaseExpiresAt?: Date | null }) {
     const old = new Date(Date.now() - PUBSUB_WAKE_STALE_MS - 600_000);
     const [wake] = await db.insert(agentWakeupRequests).values({
       companyId, agentId: ceoId, source: "automation", reason: "pubsub_message",
@@ -630,6 +675,18 @@ describeEmbeddedPostgres("PubSub wake orphan reconciliation", () => {
       startedAt: old, lastOutputAt: options.lastOutputAt, createdAt: old,
       wakeupRequestId: wake.id,
     }).returning();
+    if (options.finalizationLeaseExpiresAt !== undefined) {
+      // The finalization row is composite-keyed to (issue, run), so the
+      // fixture must provide a real issue and point the run at it.
+      const [fixtureIssue] = await db.insert(issues).values({
+        companyId, title: "Orphan fixture issue", status: "todo",
+      }).returning();
+      await db.update(heartbeatRuns).set({ nativeIssueId: fixtureIssue.id }).where(eq(heartbeatRuns.id, run.id));
+      await db.insert(nativeRunFinalizations).values({
+        runId: run.id, companyId, issueId: fixtureIssue.id,
+        phase: "observed", leaseExpiresAt: options.finalizationLeaseExpiresAt,
+      });
+    }
     await db.update(agentWakeupRequests).set({ runId: run.id }).where(eq(agentWakeupRequests.id, wake.id));
     return wake.id;
   }
@@ -652,8 +709,10 @@ describeEmbeddedPostgres("PubSub wake orphan reconciliation", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(nativeRunFinalizations);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issues);
   });
 
   afterAll(async () => {
@@ -691,6 +750,29 @@ describeEmbeddedPostgres("PubSub wake orphan reconciliation", () => {
     expect(rows.find((r) => r.id === healthy)!.status).toBe("running");
     expect(rows.find((r) => r.id === fresh)!.status).toBe("claimed");
   });
+
+  it("leaves a receipt live while its stale-looking run was re-adopted by recovery (unexpired session lease)", async () => {
+    // The "recovered wake marked failed" race: a run that looks stale at a
+    // glance (receipt aged, no fresh provider output, no legacy controller
+    // lease) but is still being driven — recovery re-adopts it and its
+    // session-execution lease is unexpired. The sweep must not finalize the
+    // receipt, or the recovered run would stop holding the company slot
+    // while it is still executing.
+    const recovered = await seedPair({
+      receiptStatus: "running", receiptAgeMs: PUBSUB_WAKE_STALE_MS + 10_000,
+      runStatus: "running", lastOutputAt: null,
+      finalizationLeaseExpiresAt: new Date(Date.now() + 10 * 60_000),
+    });
+    const stop = await service.start();
+    try {
+      await sleep(700);
+    } finally {
+      await stop();
+    }
+    const [row] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, recovered));
+    expect(row.status).toBe("running");
+    expect(row.finishedAt).toBeNull();
+  });
 });
 
 describeEmbeddedPostgres("PubSub egress delivery budget", () => {
@@ -698,6 +780,7 @@ describeEmbeddedPostgres("PubSub egress delivery budget", () => {
   let db: Db;
   let service: PubsubService;
   let identityDir: string;
+  let identityPath: string;
   let companyId: string;
   let offlinePeer: { instanceId: string; companyId: string; publicKey: string; privateKey: KeyObject };
   let refusingPeer: { instanceId: string; companyId: string; publicKey: string; privateKey: KeyObject };
@@ -708,7 +791,7 @@ describeEmbeddedPostgres("PubSub egress delivery budget", () => {
     db = createDb(tempDb.connectionString);
     identityDir = await mkdtemp(path.join(tmpdir(), "paperclip-pubsub-delivery-identity-"));
     const local = generateKeyPairSync("ed25519");
-    const identityPath = path.join(identityDir, "identity.json");
+    identityPath = path.join(identityDir, "identity.json");
     await writeFile(identityPath, JSON.stringify({
       version: 1, instanceId: randomUUID(),
       privateKey: local.privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
@@ -762,7 +845,7 @@ describeEmbeddedPostgres("PubSub egress delivery budget", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedOutboxRow(attempts: number, target: { instanceId: string; companyId: string }) {
+  async function seedOutboxRow(attempts: number, target: { instanceId: string; companyId: string }, permanentFailures = 0) {
     const messageId = randomUUID();
     const local = await service.identity();
     await db.insert(pubsubMessages).values({
@@ -773,13 +856,13 @@ describeEmbeddedPostgres("PubSub egress delivery budget", () => {
     });
     await db.insert(pubsubOutbox).values({
       companyId, messageId, peerInstanceId: target.instanceId, peerCompanyId: target.companyId,
-      attempts, availableAt: new Date(),
+      attempts, permanentFailures, availableAt: new Date(),
     });
     return messageId;
   }
 
-  it("cancels a permanently rejecting peer once the attempt budget is exhausted", async () => {
-    const messageId = await seedOutboxRow(PUBSUB_DELIVERY_MAX_ATTEMPTS - 1, refusingPeer);
+  it("cancels a permanently rejecting peer once the permanent-rejection budget is exhausted", async () => {
+    const messageId = await seedOutboxRow(PUBSUB_DELIVERY_MAX_ATTEMPTS - 1, refusingPeer, PUBSUB_DELIVERY_MAX_ATTEMPTS - 1);
     const stop = await service.start();
     try {
       await sleep(700);
@@ -787,8 +870,10 @@ describeEmbeddedPostgres("PubSub egress delivery budget", () => {
       expect(row.deliveredAt).toBeNull();
       expect(row.cancelledAt).not.toBeNull();
       expect(row.attempts).toBe(PUBSUB_DELIVERY_MAX_ATTEMPTS);
+      expect(row.permanentFailures).toBe(PUBSUB_DELIVERY_MAX_ATTEMPTS);
       expect(row.lastError).toContain("HTTP 403");
       expect(row.lastError).toContain("delivery budget exhausted");
+      expect(row.lastError).toContain("permanent rejections");
     } finally {
       await stop();
     }
@@ -807,7 +892,107 @@ describeEmbeddedPostgres("PubSub egress delivery budget", () => {
       expect(row.deliveredAt).toBeNull();
       expect(row.cancelledAt).toBeNull();
       expect(row.attempts).toBe(PUBSUB_DELIVERY_MAX_ATTEMPTS);
+      expect(row.permanentFailures).toBe(0);
       expect(row.lastError).not.toContain("delivery budget exhausted");
+    } finally {
+      await stop();
+    }
+  });
+
+  it("does not cancel a single permanent rejection after an outage past the attempt budget", async () => {
+    // The peer was offline through the whole legacy attempt budget, then came
+    // back and rejected once (e.g. mid key rotation). The offline period must
+    // not have pre-spent the budget: the first permanent rejection after the
+    // outage is just one permanent rejection, so the row reschedules instead
+    // of cancelling.
+    const messageId = await seedOutboxRow(PUBSUB_DELIVERY_MAX_ATTEMPTS, refusingPeer);
+    const stop = await service.start();
+    try {
+      await sleep(700);
+      const [row] = await db.select().from(pubsubOutbox).where(eq(pubsubOutbox.messageId, messageId));
+      expect(row.deliveredAt).toBeNull();
+      expect(row.cancelledAt).toBeNull();
+      expect(row.attempts).toBe(PUBSUB_DELIVERY_MAX_ATTEMPTS + 1);
+      expect(row.permanentFailures).toBe(1);
+      expect(row.lastError).toContain("HTTP 403");
+      expect(row.lastError).not.toContain("delivery budget exhausted");
+      expect(row.availableAt!.getTime()).toBeGreaterThan(Date.now());
+    } finally {
+      await stop();
+    }
+  });
+
+  it("treats a DNS resolution failure as transient and spares the permanent-rejection budget", async () => {
+    // A peer whose name fails to resolve is a network-level failure, not a
+    // policy rejection: it must retry with backoff without accumulating a
+    // permanent rejection, no matter how many total attempts have already
+    // happened.
+    const dnsKeys = generateKeyPairSync("ed25519");
+    const dnsPeer = {
+      instanceId: randomUUID(), companyId: randomUUID(),
+      publicKey: dnsKeys.publicKey.export({ type: "spki", format: "pem" }).toString(),
+      privateKey: dnsKeys.privateKey,
+    };
+    // Inserted directly so the trust write itself is not rejected by the
+    // guard's upfront resolution; dispatch re-validates on every attempt.
+    await db.insert(pubsubTrust).values({
+      companyId, peerInstanceId: dnsPeer.instanceId, peerCompanyId: dnsPeer.companyId,
+      publicKey: dnsPeer.publicKey, url: "https://pubsub-dns-fail.invalid:8443/api/pubsub/deliver",
+      topics: ["fleet.chat.*"], revokedAt: null,
+    });
+    await db.insert(pubsubSubscriptions).values({ companyId, peerInstanceId: dnsPeer.instanceId, topic: "fleet.chat.budget" });
+    const messageId = await seedOutboxRow(PUBSUB_DELIVERY_MAX_ATTEMPTS - 1, dnsPeer);
+    const stop = await service.start();
+    try {
+      await sleep(700);
+      const [row] = await db.select().from(pubsubOutbox).where(eq(pubsubOutbox.messageId, messageId));
+      expect(row.deliveredAt).toBeNull();
+      expect(row.cancelledAt).toBeNull();
+      expect(row.attempts).toBe(PUBSUB_DELIVERY_MAX_ATTEMPTS);
+      expect(row.permanentFailures).toBe(0);
+      expect(row.lastError).toContain("could not be resolved");
+      expect(row.lastError).not.toContain("delivery budget exhausted");
+    } finally {
+      await stop();
+    }
+  });
+
+  it("refuses private egress for an inherited-property hostname at dispatch time", async () => {
+    // Dispatch re-checks the allowlist on every attempt with the same
+    // own-property lookup: a trust row whose URL hostname is an inherited
+    // property name (seeded directly, bypassing the trust-write check) must
+    // be rejected as private even though a different host is allowlisted,
+    // and the rejection counts as a permanent policy failure.
+    const ctorKeys = generateKeyPairSync("ed25519");
+    const ctorPeer = {
+      instanceId: randomUUID(), companyId: randomUUID(),
+      publicKey: ctorKeys.publicKey.export({ type: "spki", format: "pem" }).toString(),
+      privateKey: ctorKeys.privateKey,
+    };
+    await db.insert(pubsubTrust).values({
+      companyId, peerInstanceId: ctorPeer.instanceId, peerCompanyId: ctorPeer.companyId,
+      publicKey: ctorPeer.publicKey, url: "https://constructor:8443/api/pubsub/deliver",
+      topics: ["fleet.chat.*"], revokedAt: null,
+    });
+    await db.insert(pubsubSubscriptions).values({ companyId, peerInstanceId: ctorPeer.instanceId, topic: "fleet.chat.budget" });
+    const ctorService = createPubsubService(db, {
+      identityPath,
+      privatePeerHosts: ["127.0.0.1"],
+      peerDnsLookup: async () => [{ address: "127.0.0.1", family: 4 }],
+    });
+    const messageId = await seedOutboxRow(0, ctorPeer);
+    const stop = await ctorService.start();
+    try {
+      await sleep(700);
+      const [row] = await db.select().from(pubsubOutbox).where(eq(pubsubOutbox.messageId, messageId));
+      expect(row.deliveredAt).toBeNull();
+      expect(row.cancelledAt).toBeNull();
+      // Every dispatch attempt was the same policy rejection, so the
+      // permanent counter tracks attempts 1:1 — regardless of how many
+      // worker ticks fired during the sleep.
+      expect(row.attempts).toBe(row.permanentFailures);
+      expect(row.permanentFailures).toBeGreaterThanOrEqual(1);
+      expect(row.lastError).toContain("private or reserved");
     } finally {
       await stop();
     }
@@ -883,6 +1068,31 @@ describeEmbeddedPostgres("PubSub peer egress allowlist", () => {
   it("accepts an allowlisted loopback peer and stores the normalized URL", async () => {
     const row = await loopbackService.addTrust(trustInput("http://localhost:3100/api/pubsub/deliver"));
     expect(row.url).toBe("http://127.0.0.1:3100/api/pubsub/deliver");
+  });
+
+  it("rejects an inherited-property hostname even when other hosts are allowlisted", async () => {
+    // The old lookup read `privatePeerHosts[hostname]` as a plain property,
+    // so a peer URL hostname such as `constructor` hit Object.prototype and
+    // was treated as operator-allowlisted. The lookup must be own-property
+    // only: with a different host allowlisted, `constructor` resolves to a
+    // private address and the trust write is rejected.
+    const dnsPinnedService = createPubsubService(db, {
+      identityPath,
+      privatePeerHosts: ["127.0.0.1"],
+      peerDnsLookup: async () => [{ address: "127.0.0.1", family: 4 }],
+    });
+    await expect(dnsPinnedService.addTrust(trustInput("https://constructor:8443/api/pubsub/deliver")))
+      .rejects.toMatchObject({ status: 400, message: expect.stringContaining("private or reserved") });
+  });
+
+  it("accepts an inherited-property hostname only when the operator allowlisted that exact host", async () => {
+    const dnsPinnedService = createPubsubService(db, {
+      identityPath,
+      privatePeerHosts: ["constructor"],
+      peerDnsLookup: async () => [{ address: "127.0.0.1", family: 4 }],
+    });
+    const row = await dnsPinnedService.addTrust(trustInput("https://constructor:8443/api/pubsub/deliver"));
+    expect(row.url).toBe("https://constructor:8443/api/pubsub/deliver");
   });
 });
 

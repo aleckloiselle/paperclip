@@ -78,7 +78,7 @@ const LIVE_WAKE_STATUSES = ["queued", "claimed", "coalesced", "deferred_issue_ex
 const DELIVERED_WAKE_STATUSES = [...LIVE_WAKE_STATUSES, "completed", "failed"];
 const SETTLED_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out", "interrupted", "skipped"];
 /** Linked run rows the guard's EXISTS reads: status plus liveness evidence. */
-type StubRun = { status: string; lastOutputAt?: string | null; startedAt?: string | null; createdAt?: string | null; controllerLeaseExpiresAt?: string | null };
+type StubRun = { status: string; lastOutputAt?: string | null; startedAt?: string | null; createdAt?: string | null; controllerLeaseExpiresAt?: string | null; sessionLeaseExpiresAt?: string | null };
 
 /**
  * Fixture db emulating the wake bridge's `agent_wakeup_requests` queries: the
@@ -87,9 +87,9 @@ type StubRun = { status: string; lastOutputAt?: string | null; startedAt?: strin
  * post-wake check filters exact key + delivered status (selects id). The
  * guard mirrors production: a live receipt holds the slot while its linked
  * run (from `runs`) is open AND still shows liveness (unexpired controller
- * lease or an activity clock inside the stale window), or while the receipt
- * itself is inside the stale window; terminal receipts hold it through the
- * cooldown.
+ * lease, unexpired native session-execution lease, or activity clock inside
+ * the stale window), or while the receipt itself is inside the stale window;
+ * terminal receipts hold it through the cooldown.
  */
 function wakeBridgeDb(options: {
   ceo: { id: string; companyId: string; role: string; status: string; adapterType: string };
@@ -111,9 +111,9 @@ function wakeBridgeDb(options: {
         && DELIVERED_WAKE_STATUSES.includes(receipt.status));
       // Guard: live wakes hold the slot while their linked run is open AND
       // demonstrates liveness (mirrors production's EXISTS over
-      // heartbeat_runs with the lease/activity-clock predicate), or while the
-      // receipt itself is inside the stale window; terminal wakes hold it
-      // through the cooldown.
+      // heartbeat_runs plus the native_run_finalizations session lease), or
+      // while the receipt itself is inside the stale window; terminal wakes
+      // hold it through the cooldown.
       return options.receipts.filter((receipt) => {
         if (receipt.companyId !== options.companyId) return false;
         if (LIVE_WAKE_STATUSES.includes(receipt.status)) {
@@ -122,7 +122,8 @@ function wakeBridgeDb(options: {
           const activityClock = run ? run.lastOutputAt ?? run.startedAt ?? run.createdAt ?? null : null;
           const runLive = runStillOpen && run !== undefined && (
             (run.controllerLeaseExpiresAt != null && Date.parse(run.controllerLeaseExpiresAt) >= Date.now())
-            || (activityClock != null && Date.parse(activityClock) >= Date.now() - PUBSUB_WAKE_STALE_MS));
+            || (activityClock != null && Date.parse(activityClock) >= Date.now() - PUBSUB_WAKE_STALE_MS)
+            || (run.sessionLeaseExpiresAt != null && Date.parse(run.sessionLeaseExpiresAt) >= Date.now()));
           return runLive || Date.parse(receipt.updatedAt) >= Date.now() - PUBSUB_WAKE_STALE_MS;
         }
         return ["completed", "failed"].includes(receipt.status) && receipt.finishedAt !== null
@@ -335,6 +336,37 @@ describe("PubSub wake task scope for native-runner CEOs", () => {
       // forever. Once the receipt AND every liveness signal on the run age
       // past the stale window, the slot must be released for new wakes.
       runs: { [runId]: { status: "running", startedAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 600_000)).toISOString(), lastOutputAt: null, createdAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 600_000)).toISOString(), controllerLeaseExpiresAt: null } },
+      receipts: [{ status: "claimed", runId, updatedAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 1_000)).toISOString(), idempotencyKey: otherKey }],
+    });
+    await createPubsubWake(db, heartbeat)(companyId, message);
+    expect(seen).toHaveLength(1);
+  });
+
+  it("keeps deferring while a live PubSub receipt's linked run holds an unexpired native session lease", async () => {
+    const otherKey = `pubsub:${randomUUID()}:${randomUUID()}:${randomUUID()}:${randomUUID()}`;
+    const runId = randomUUID();
+    const { db, heartbeat, seen, message, companyId } = wakeHarness({
+      adapterType: "claude_local",
+      // A wake in a quiet stretch — the receipt and the activity clock are
+      // both long past the stale window and there is no legacy controller
+      // lease — but the native session executor is still driving the run:
+      // its execution lease is unexpired, so the slot must stay held.
+      runs: { [runId]: { status: "running", startedAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 600_000)).toISOString(), lastOutputAt: null, createdAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 600_000)).toISOString(), controllerLeaseExpiresAt: null, sessionLeaseExpiresAt: new Date(Date.now() + 10 * 60_000).toISOString() } },
+      receipts: [{ status: "running", runId, updatedAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 600_000)).toISOString(), idempotencyKey: otherKey }],
+    });
+    await expect(createPubsubWake(db, heartbeat)(companyId, message)).rejects.toThrow("in flight");
+    expect(seen).toHaveLength(0);
+  });
+
+  it("re-allows a wake once a stale live PubSub receipt's linked run's session lease has expired (orphan)", async () => {
+    const otherKey = `pubsub:${randomUUID()}:${randomUUID()}:${randomUUID()}:${randomUUID()}`;
+    const runId = randomUUID();
+    const { db, heartbeat, seen, message, companyId } = wakeHarness({
+      adapterType: "claude_local",
+      // The SIGKILL orphan with a session lease the dead controller stopped
+      // renewing: once the lease expired within its own TTL, no liveness
+      // evidence remains and the slot releases.
+      runs: { [runId]: { status: "running", startedAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 600_000)).toISOString(), lastOutputAt: null, createdAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 600_000)).toISOString(), controllerLeaseExpiresAt: null, sessionLeaseExpiresAt: new Date(Date.now() - 60_000).toISOString() } },
       receipts: [{ status: "claimed", runId, updatedAt: new Date(Date.now() - (PUBSUB_WAKE_STALE_MS + 1_000)).toISOString(), idempotencyKey: otherKey }],
     });
     await createPubsubWake(db, heartbeat)(companyId, message);

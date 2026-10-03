@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, exists, gte, inArray, isNull, like, notInArray, or, sql, type SQL } from "drizzle-orm";
-import { agents, agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { agents, agentWakeupRequests, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { PubsubInboundMessage } from "./pubsub.js";
 import { issueService } from "./issues.js";
 import { PUBSUB_WAKE_COOLDOWN_MS, PUBSUB_WAKE_STALE_MS } from "@paperclipai/shared";
@@ -26,21 +26,39 @@ export const PUBSUB_SETTLED_RUN_STATUSES = [
 /**
  * Whether a wake receipt's linked run is actually live right now, judged from
  * the platform's own liveness evidence rather than "status not terminal": a
- * legacy controller still renewing its 60-second lease, or recent movement on
+ * legacy controller still renewing its 60-second lease, recent movement on
  * the run's activity clock (last provider output, else start, else creation —
- * the clock the output-silence watchdog and the shared-workspace holder use).
- * A run orphaned by a SIGKILL — or deliberately parked by recovery while
- * ownership evidence is pending — stops producing evidence but never settles;
- * without this bound such a run would hold its receipt, the company's wake
- * slot, and every inbound delivery's 429 indefinitely. The wake guard and the
- * orphan-reconciliation sweep share this verdict, consistent with the 60s
- * stale-claim convention in dispatchPendingNativeStatusWakeups.
+ * the clock the output-silence watchdog and the shared-workspace holder use),
+ * or an unexpired native session-execution lease.
+ *
+ * The session lease is the platform's own "this controller is driving this
+ * run" verdict: the native session executor claims a row in
+ * native_run_finalizations when it starts driving a run and renews its lease
+ * (5-minute interval, 20-minute TTL) for the whole execution, so a healthy
+ * long run in a quiet stretch — a long tool call with no provider output —
+ * still demonstrates liveness and keeps the company slot, instead of a second
+ * non-coalesced wake starting mid-run. When the controller dies the renewal
+ * stops and the lease expires within its TTL, after which the run reverts to
+ * the output/controller-lease evidence (and, absent that, to the receipt's
+ * own stale window) exactly as a SIGKILL orphan or a run deliberately parked
+ * by recovery while ownership evidence is pending: such a run stops producing
+ * evidence but never settles, and without these bounds it would hold its
+ * receipt, the company's wake slot, and every inbound delivery's 429
+ * indefinitely. The wake guard and the orphan-reconciliation sweep share this
+ * verdict, consistent with the 60s stale-claim convention in
+ * dispatchPendingNativeStatusWakeups.
  */
 export function pubsubRunIsLive(now: Date): SQL {
   const staleCutoff = new Date(now.getTime() - PUBSUB_WAKE_STALE_MS);
   return or(
     sql`${heartbeatRuns.controllerLeaseExpiresAt} is not null and ${heartbeatRuns.controllerLeaseExpiresAt} > ${now.toISOString()}::timestamptz`,
     sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${staleCutoff.toISOString()}::timestamptz`,
+    sql`exists (
+      select 1 from ${nativeRunFinalizations}
+      where ${nativeRunFinalizations.runId} = ${heartbeatRuns.id}
+        and ${nativeRunFinalizations.leaseExpiresAt} is not null
+        and ${nativeRunFinalizations.leaseExpiresAt} > ${now.toISOString()}::timestamptz
+    )`,
   )!;
 }
 
@@ -149,16 +167,19 @@ export function createPubsubWake(db: Db, heartbeat: PubsubHeartbeat) {
     // The live clause is bound to the linked run's demonstrated liveness, not
     // merely to its non-terminal status: a healthy long-running CEO wake keeps
     // producing liveness evidence (controller-lease renewals, provider output,
-    // a recent start) and holds the slot even past the stale window, so it
-    // must not release the slot mid-run and admit a second, non-coalesced
-    // wake. A run orphaned by a SIGKILL — or preserved by recovery while
-    // ownership evidence is pending — stops producing evidence and never
-    // settles on its own; once the receipt itself ages past the stale window
-    // the slot is free again, the same 60s bound as the stale-claim
-    // convention in dispatchPendingNativeStatusWakeups. Live receipts with no
-    // linked run fall back to the stale window alone; the per-agent
-    // concurrency policy and the wake admission deferral still bound any wake
-    // admitted past the guard.
+    // a recent start, or — for native runs — the session executor's execution
+    // lease, held for the whole run and renewed while its controller is
+    // alive) and holds the slot even past the stale window, so it must not
+    // release the slot mid-run and admit a second, non-coalesced wake. A run
+    // orphaned by a SIGKILL — or preserved by recovery while ownership
+    // evidence is pending — stops producing evidence (any session lease
+    // expires within its own TTL) and never settles on its own; once the
+    // receipt itself ages past the stale window and the run shows no
+    // liveness evidence the slot is free again, the same 60s bound as the
+    // stale-claim convention in dispatchPendingNativeStatusWakeups. Live
+    // receipts with no linked run fall back to the stale window alone; the
+    // per-agent concurrency policy and the wake admission deferral still
+    // bound any wake admitted past the guard.
     await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`pubsub-wake:${companyId}`}, 0))`);
       const guardNow = new Date();

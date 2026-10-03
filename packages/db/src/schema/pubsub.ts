@@ -59,6 +59,7 @@ export const pubsubOutbox = pgTable("pubsub_outbox", {
   peerInstanceId: uuid("peer_instance_id").notNull(),
   peerCompanyId: uuid("peer_company_id").notNull(),
   attempts: integer("attempts").notNull().default(0),
+  permanentFailures: integer("permanent_failures").notNull().default(0),
   availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
   deliveredAt: timestamp("delivered_at", { withTimezone: true }),
   cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
